@@ -234,17 +234,6 @@ impl Wallet {
         Ok(ua.encode(&MainNetwork))
     }
 
-    /// Get the default Sapling address.
-    pub fn get_sapling_address(&self) -> Result<String> {
-        let ufvk = self.usk.to_unified_full_viewing_key();
-        let sapling_dfvk = ufvk.sapling().ok_or_else(|| anyhow!("No Sapling key"))?;
-        let (_, address) = sapling_dfvk.default_address();
-        Ok(zcash_client_backend::encoding::encode_payment_address(
-            zcash_protocol::constants::mainnet::HRP_SAPLING_PAYMENT_ADDRESS,
-            &address,
-        ))
-    }
-
     /// Get the default address (unified).
     pub fn get_address(&self) -> Result<String> {
         self.get_unified_address()
