@@ -9,6 +9,31 @@ A two-factor authentication (2FA) service using shielded Zcash transactions. Use
 3. **OTP generation** - For valid verification requests, ZVS generates an HMAC-SHA256 based 6-digit OTP
 4. **Response transaction** - ZVS sends the OTP back to the user via a shielded transaction memo
 
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   USER                                         ZVS (service wallet)         │
+│                                                                             │
+│   ┌─────────┐      tx with memo:               ┌─────────┐                  │
+│   │         │      "VERIFY:session123:u1..."   │         │                  │
+│   │  Wallet │ ──────────────────────────────►  │  Wallet │                  │
+│   │         │                                  │         │                  │
+│   └─────────┘                                  └────┬────┘                  │
+│        ▲                                            │                       │
+│        │                                            │ 1. Decrypt memo       │
+│        │                                            │ 2. Parse session ID   │
+│        │                                            │ 3. HMAC(secret, session)│
+│        │                                            │ 4. Generate OTP       │
+│        │                                            ▼                       │
+│        │                                       ┌─────────┐                  │
+│        │       tx with memo:                   │  Build  │                  │
+│        │       "OTP:847291:ref:abc123"         │   tx    │                  │
+│        └────────────────────────────────────── │         │                  │
+│                                                └─────────┘                  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Requirements
 
 - Rust toolchain (edition 2021)
