@@ -1,155 +1,196 @@
-# ZVS Mempool Streaming Refactor - Handoff
+# ZVS Handoff - Current State
 
-## What Was Done
+## Project Overview
 
-### Removed Block Syncing Code
+ZVS (Zcash Verification Service) sends OTPs for received transactions with memos matching verification rules. It monitors the mempool in real-time and responds instantly.
 
-**main.rs:**
-- Removed `POLL_INTERVAL` env var
-- Removed `run_service()` block polling loop
-- Added placeholder `run_mempool_service()` that calls `wallet.stream_mempool()` (not implemented)
+## What's Complete
 
-**wallet.rs:**
-- Removed `MemoryBlockSource` struct
-- Removed `SyncResult` struct
-- Removed `sync()` method
-- Removed `download_blocks()` method
-- Removed `get_chain_state_at()` method
-- Removed `get_scanned_height()` method
-- Removed `fetch_pending_memos()` method
-- Removed `get_all_memos()` method
-- Cleaned up unused imports
+### Phase 1: Detection Pipeline ✅
 
-**Kept in wallet.rs:**
-- `get_chain_height()` - needed for broadcast
-- `fetch_birthday_static()` - needed for wallet init
-- `fetch_and_process_transaction()` - fetches tx by txid (may be useful)
-- Transaction creation/broadcast methods
+```
+✅ Stream mempool (scan.rs)
+✅ Decrypt memos (wallet.rs)
+✅ Validate memo format ("pineapple" test)
+✅ Check payment >= 2000 zats
+✅ Generate OTP (HMAC-SHA256)
+✅ Log what we WOULD send (dry run mode)
+```
+
+**Files modified:**
+- `src/main.rs` - Main runner with mempool streaming loop
+- `src/sync.rs` - `fetch_birthday()` for wallet initialization
+- `src/scan.rs` - Mempool streaming from lightwalletd
+- `src/wallet.rs` - Local wallet operations (decrypt, balance, address)
+- `src/memo_rules.rs` - Validation rules (MIN_PAYMENT, validate_memo)
+- `src/otp_rules.rs` - OTP generation (generate_otp, build_otp_memo)
+
+**Run it:**
+```bash
+cargo run
+```
+
+**Expected output when verification request arrives:**
+```
+=== VERIFICATION REQUEST ===
+Session: pineapple
+Payment: 2000 zats ✓
+Request tx: abc123...
+Generated OTP: 847291
+Response memo: ZVS:otp:847291:req:abc123...
+Reply to: u1tdkyje8l5grq8h...
+[DRY RUN] Would send 1000 zats to u1tdkyje8l5grq8h...
+============================
+```
 
 ---
 
-## What Needs To Be Done
+## What's Next
 
-### 1. Implement Mempool Streaming in `scan.rs`
+### Phase 2: Wallet Sync ⬜
 
-The lightwalletd gRPC API provides:
+The wallet needs to sync blocks to:
+- Know spendable balance
+- Track spent notes (avoid double-spend)
+- Confirm OTP responses were mined
 
-```protobuf
-// Returns full raw transactions - can decrypt memos
-rpc GetMempoolStream(Empty) returns (stream RawTransaction) {}
-```
+**Approach:** Use raw `zcash_client_backend` primitives.
 
-**RawTransaction format:**
+**Break into small problems:**
+
+| # | Problem | Function | Complexity |
+|---|---------|----------|------------|
+| 1 | Get chain tip height | `client.get_latest_block()` | Easy |
+| 2 | Tell wallet about chain tip | `db.update_chain_tip(height)` | Easy |
+| 3 | Get scan ranges needed | `db.suggest_scan_ranges()` | Easy |
+| 4 | Download subtree roots | `client.get_subtree_roots()` | Medium |
+| 5 | Download compact blocks | `client.get_block_range()` | Medium |
+| 6 | Scan blocks for our txs | `scan_cached_blocks()` | Hard |
+
+**Reference implementation:** `zcash-devtool/src/commands/wallet/sync.rs`
+
+**Key functions to implement in `sync.rs`:**
 ```rust
-RawTransaction {
-    data: Vec<u8>,  // Full serialized transaction
-    height: u64,    // 0 = mempool, other = mined height
-}
+// Problem 1: Get chain tip
+pub async fn get_chain_tip(client: &mut Client) -> Result<BlockHeight>
+
+// Problem 2: Update chain tip
+pub fn update_chain_tip(db: &mut WalletDb, height: BlockHeight) -> Result<()>
+
+// Problem 3-6: Full sync
+pub async fn sync_to_tip(client: &mut Client, db: &mut WalletDb) -> Result<()>
 ```
 
-**Existing decryption functions in scan.rs:**
+---
+
+### Phase 3: Transaction Sending ⬜
+
+Once wallet is synced, we can send OTP responses.
+
+**Already implemented in `otp_rules.rs`:**
+- `create_otp_transaction_request()` - Creates ZIP-321 request
+- `create_change_strategy()` - Fee strategy for transactions
+
+**Need to add to `wallet.rs`:**
 ```rust
-decrypt_sapling_memo(tx: &Transaction, ufvk: &UnifiedFullViewingKey, block_height: BlockHeight) -> Result<Option<String>>
-decrypt_orchard_memo(tx: &Transaction, ufvk: &UnifiedFullViewingKey) -> Result<Option<String>>
+pub async fn send_otp_response(
+    &mut self,
+    client: &mut Client,
+    recipient: &str,
+    otp: &str,
+    request_txid: &str,
+) -> Result<TxId>
 ```
 
-### 2. Implementation Pattern (from Zashi)
+**Flow:**
+1. Create transaction request with OTP memo
+2. Propose transfer (input selection)
+3. Create and sign transaction
+4. Broadcast via lightwalletd
 
-```
-┌──────────────────────────────────────────────────┐
-│  watchMempool() loop                             │
-├──────────────────────────────────────────────────┤
-│  Connect to GetMempoolStream                     │
-│       ↓                                          │
-│  Process each RawTransaction                     │
-│       ↓                                          │
-│  Parse: Transaction::read(data, branch_id)       │
-│       ↓                                          │
-│  Decrypt memo (Sapling/Orchard)                  │
-│       ↓                                          │
-│  If relevant → handle_memo()                     │
-│       ↓                                          │
-│  Stream ends (block mined)                       │
-│       ↓                                          │
-│  ├─ Success: wait 500ms → reconnect              │
-│  └─ Failure: wait 30s (backoff) → reconnect      │
-└──────────────────────────────────────────────────┘
-```
+---
 
-### 3. Key Code Snippets
+### Phase 4: Robustness ⬜
 
-**Connecting to mempool stream:**
-```rust
-use zcash_client_backend::proto::service::Empty;
+- SQLite deduplication table (track responded requests)
+- Retry queue for failed sends
+- Periodic block catch-up (not just startup sync)
 
-let mut stream = client
-    .get_mempool_stream(Empty {})
-    .await?
-    .into_inner();
+---
 
-while let Some(raw_tx) = stream.next().await {
-    let raw_tx = raw_tx?;
-    // Process transaction...
-}
+## Environment Variables
+
+```bash
+LIGHTWALLETD_URL=https://zec.rocks:443
+SEED_HEX=<wallet seed hex>
+BIRTHDAY_HEIGHT=3238000
+OTP_SECRET=<hmac secret hex>
+ZVS_DATA_DIR=./zvs_data  # optional
 ```
 
-**Parsing mempool transaction:**
-```rust
-// height=0 means mempool, use current network upgrade
-let block_height = BlockHeight::from_u32(2_600_000); // Post-NU5
-let branch_id = BranchId::for_height(&MainNetwork, block_height);
+---
 
-let tx = Transaction::read(&raw_tx.data[..], branch_id)?;
-let txid_hex = hex::encode(tx.txid().as_ref());
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         STARTUP                                  │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Load config (.env)                                           │
+│  2. Connect to lightwalletd                                      │
+│  3. Fetch birthday tree state                                    │
+│  4. Initialize wallet (SQLite)                                   │
+│  5. [Phase 2] Sync to chain tip                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      MAIN SERVICE LOOP                           │
+├─────────────────────────────────────────────────────────────────┤
+│   Mempool Stream (real-time)                                     │
+│     ↓                                                            │
+│   Decrypt memo → Validate → Generate OTP                        │
+│     ↓                                                            │
+│   [Phase 3] Send OTP response transaction                        │
+│     ↓                                                            │
+│   [Phase 4] Record in dedup table                                │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**Decrypting memo:**
-```rust
-let ufvk = usk.to_unified_full_viewing_key();
+---
 
-// Try Sapling
-if let Some(memo) = decrypt_sapling_memo(&tx, &ufvk, block_height)? {
-    // Found memo in Sapling output
-}
+## File Structure
 
-// Try Orchard
-if let Some(memo) = decrypt_orchard_memo(&tx, &ufvk)? {
-    // Found memo in Orchard output
-}
+```
+src/
+├── main.rs        # Entry point, service orchestration
+├── wallet.rs      # Local wallet ops (keys, decrypt, balance)
+├── scan.rs        # Mempool streaming
+├── sync.rs        # Wallet sync with lightwalletd [Phase 2]
+├── memo_rules.rs  # Validation (MIN_PAYMENT, validate_memo)
+└── otp_rules.rs   # OTP generation and response creation
 ```
 
-### 4. Fix main.rs
+---
 
-Current `run_mempool_service()` calls `wallet.stream_mempool()` which doesn't exist.
+## Commits
 
-Either:
-- Add `stream_mempool()` to `Wallet` struct
-- Or refactor main.rs to call mempool streaming from `scan.rs`
+```
+6c575f3 feat: implement mempool streaming with channel-based processing
+aee6f6f feat: add sync module and architecture documentation
+6f7fc4b feat: wire up memo validation and OTP generation
+```
 
 ---
 
 ## Testing
 
-Test script exists: `./test_mempool.sh`
+**Manual test:**
+1. Run `cargo run`
+2. Send transaction to ZVS wallet address with "pineapple" memo (≥2000 zats)
+3. Watch for verification request log
 
+**Debug mempool traffic:**
 ```bash
-./test_mempool.sh
+RUST_LOG=debug cargo run
 ```
-
-This streams raw mempool transactions from zec.rocks:443 using grpcurl.
-
----
-
-## Proto Reference
-
-File: `librustzcash/zcash_client_backend/lightwallet-protocol/walletrpc/service.proto`
-
-```protobuf
-// Returns compact transactions - NO decryption possible
-rpc GetMempoolTx(GetMempoolTxRequest) returns (stream CompactTx) {}
-
-// Returns FULL raw transactions - decryption possible
-rpc GetMempoolStream(Empty) returns (stream RawTransaction) {}
-```
-
-Use `GetMempoolStream` for shielded memo decryption.

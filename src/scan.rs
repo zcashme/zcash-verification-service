@@ -80,8 +80,3 @@ where
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    // Tests would require a mock gRPC server
-}

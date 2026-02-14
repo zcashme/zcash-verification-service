@@ -1,8 +1,4 @@
 //! Wallet synchronization with lightwalletd.
-//!
-//! This module handles network operations for syncing wallet state:
-//! - Fetching account birthday (tree state)
-//! - Block scanning (future)
 
 use anyhow::{anyhow, Result};
 use tonic::transport::Channel;
@@ -13,10 +9,6 @@ use zcash_client_backend::{
 };
 
 /// Fetch the account birthday from lightwalletd.
-///
-/// This retrieves the tree state at `birthday_height - 1`, which is needed
-/// to initialize a new wallet account. Only called once when wallet.db
-/// doesn't exist yet.
 pub async fn fetch_birthday(
     client: &mut CompactTxStreamerClient<Channel>,
     birthday_height: u32,

@@ -15,7 +15,7 @@ tonic = { version = "0.14", features = ["channel"] }
 prost = "0.14"
 
 # Core zcash dependencies - let these pull in compatible versions
-zcash_client_backend = { version = "0.21", features = ["lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots", "lightwalletd-tonic-transport", "orchard"] }
+zcash_client_backend = { version = "0.21", features = ["lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots", "lightwalletd-tonic-transport", "orchard", "sync"] }
 zcash_client_sqlite = { version = "0.19", features = ["orchard"] }
 zcash_protocol = "0.7"
 zcash_proofs = { version = "0.26", features = ["local-prover"] }
