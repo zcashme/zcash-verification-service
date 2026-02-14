@@ -13,6 +13,13 @@ use crate::memo_rules::{is_valid_payment, MIN_PAYMENT};
 use crate::otp_rules::{create_otp_transaction_request, generate_otp, OtpResponseParams};
 use crate::wallet::{ReceivedMemo, SyncResult, Wallet};
 
+/// A pending verification request with its generated OTP.
+pub struct PendingRequest {
+    pub session_id: String,
+    pub otp: String,
+    pub txid_hex: String,
+}
+
 /// The ZVS verification service.
 ///
 /// Wraps a Wallet with 2FA/OTP functionality - monitors for verification
@@ -56,8 +63,20 @@ impl VerificationService {
         self.wallet.get_address()
     }
 
-    pub async fn get_received_memos(&mut self) -> Result<Vec<ReceivedMemo>> {
-        self.wallet.get_all_memos().await
+    /// Get pending verification requests with their generated OTPs.
+    pub async fn get_pending_requests(&mut self) -> Result<Vec<PendingRequest>> {
+        let memos = self.wallet.get_all_memos().await?;
+        let requests = memos
+            .into_iter()
+            .filter_map(|memo| {
+                memo.verification.as_ref().map(|v| PendingRequest {
+                    session_id: v.session_id.clone(),
+                    otp: self.generate_otp(&v.session_id),
+                    txid_hex: memo.txid_hex.clone(),
+                })
+            })
+            .collect();
+        Ok(requests)
     }
 
     // =========================================================================

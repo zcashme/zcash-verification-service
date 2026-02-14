@@ -12,7 +12,6 @@ mod scan;
 mod verification;
 mod wallet;
 
-use otp_rules::generate_otp;
 use verification::VerificationService;
 
 #[tokio::main]
@@ -59,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &seed,
         birthday_height,
         &data_dir,
-        otp_secret.clone(),
+        otp_secret,
     ).await?;
 
     match service.get_address() {
@@ -77,30 +76,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    match service.get_received_memos().await {
-        Ok(memos) => {
-            let valid_requests: Vec<_> = memos.iter()
-                .filter(|m| m.verification.is_some())
-                .collect();
-
-            println!("Received transactions: {} total, {} valid verification requests",
-                     memos.len(), valid_requests.len());
-
-            if !valid_requests.is_empty() {
-                println!("\nPending verification requests:");
-                for memo in valid_requests.iter().take(10) {
-                    if let Some(ref v) = memo.verification {
-                        let otp = generate_otp(&otp_secret, &v.session_id);
-                        println!("  - session: {}, OTP: {}, tx: {}",
-                                 v.session_id, otp, memo.txid_hex);
-                    }
-                }
-                if valid_requests.len() > 10 {
-                    println!("  ... and {} more", valid_requests.len() - 10);
-                }
+    match service.get_pending_requests().await {
+        Ok(requests) => {
+            println!("Pending verification requests: {}", requests.len());
+            for req in requests.iter().take(10) {
+                println!("  - session: {}, OTP: {}, tx: {}", req.session_id, req.otp, req.txid_hex);
+            }
+            if requests.len() > 10 {
+                println!("  ... and {} more", requests.len() - 10);
             }
         }
-        Err(e) => println!("Could not fetch memos: {}", e),
+        Err(e) => println!("Could not fetch pending requests: {}", e),
     }
     println!();
 
