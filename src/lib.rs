@@ -6,13 +6,12 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
-use rusqlite::Connection;
 use secrecy::Secret;
 use sha2::Sha256;
 use tracing::{debug, error, info, warn};
@@ -159,7 +158,6 @@ pub struct ZVS {
     account_id: AccountUuid,
     usk: UnifiedSpendingKey,
     birthday_height: u32,
-    db_path: PathBuf,
     otp_secret: Vec<u8>,
 }
 
@@ -225,7 +223,6 @@ impl ZVS {
             account_id,
             usk,
             birthday_height,
-            db_path,
             otp_secret,
         })
     }
@@ -472,74 +469,24 @@ impl ZVS {
     }
 
     async fn fetch_new_memos(&mut self) -> Result<Vec<ReceivedMemo>> {
-        let conn = Connection::open_with_flags(&self.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| anyhow!("Failed to open db: {e}"))?;
+        // TODO: Use WalletRead API to get received notes
+        //
+        // Pseudocode:
+        // 1. Get all received notes from wallet using WalletRead trait methods
+        // 2. Filter to notes we haven't responded to yet (need to track processed txids)
+        // 3. For each note:
+        //    - Get txid, block height, value
+        //    - Decrypt memo using fetch_transaction_memo()
+        //    - Validate memo and extract verification data
+        // 4. Return list of ReceivedMemo structs
+        //
+        // Required WalletRead methods to investigate:
+        // - get_known_ephemeral_addresses()
+        // - get_notes() or similar for received note enumeration
+        // - May need to iterate through transactions and extract notes
 
-        // Query received notes that we haven't responded to yet.
-        // The LEFT JOIN on sent_notes finds notes where we've sent a response
-        // containing the request txid in the memo (format: ZVS:otp:XXXXXX:req:TXID_PREFIX).
-        // Notes without a matching sent response will have sn.id IS NULL.
-        let mut stmt = conn.prepare(
-            "SELECT t.txid, t.block, srn.value
-             FROM sapling_received_notes srn
-             JOIN transactions t ON srn.transaction_id = t.id_tx
-             LEFT JOIN sent_notes sn ON sn.memo LIKE '%:req:' || substr(hex(t.txid), 1, 16) || '%'
-             WHERE sn.id IS NULL
-             ORDER BY srn.id ASC"
-        ).map_err(|e| anyhow!("Failed to prepare query: {e}"))?;
-
-        let rows: Vec<(Vec<u8>, Option<u32>, i64)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .map_err(|e| anyhow!("Failed to query: {e}"))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| anyhow!("Failed to collect: {e}"))?;
-
-        drop(stmt);
-        drop(conn);
-
-        let mut memos = Vec::new();
-
-        for (txid_bytes, block_height, value) in rows {
-            let txid_hex = hex::encode(&txid_bytes);
-            let height = block_height.unwrap_or(0);
-
-            let memo_text = match self.fetch_transaction_memo(&txid_bytes, height).await {
-                Ok(Some(text)) => {
-                    debug!("Decrypted memo from tx {}: {:?}", &txid_hex[..16], text);
-                    text
-                }
-                Ok(None) => {
-                    debug!("No memo in tx {}", &txid_hex[..16]);
-                    String::new()
-                }
-                Err(e) => {
-                    warn!("Failed to fetch memo for tx {}: {}", &txid_hex[..16], e);
-                    String::new()
-                }
-            };
-
-            let verification = if !memo_text.is_empty() {
-                validate_memo(&memo_text)
-            } else {
-                None
-            };
-
-            info!(
-                "New note: tx={}..., height={}, value={} zats, memo={}",
-                &txid_hex[..16], height, value,
-                if memo_text.is_empty() { "(empty)" } else { &memo_text }
-            );
-
-            memos.push(ReceivedMemo {
-                txid_hex,
-                height,
-                memo: memo_text,
-                value_zats: value as u64,
-                verification,
-            });
-        }
-
-        Ok(memos)
+        warn!("fetch_new_memos: Not implemented - needs WalletRead API");
+        Ok(Vec::new())
     }
 
     async fn fetch_transaction_memo(&mut self, txid: &[u8], height: u32) -> Result<Option<String>> {
@@ -720,17 +667,19 @@ impl ZVS {
     }
 
     /// Fetch raw transaction bytes from the wallet database.
-    fn fetch_raw_transaction(&self, txid: &TxId) -> Result<Vec<u8>> {
-        let conn = Connection::open_with_flags(&self.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| anyhow!("Failed to open db: {e}"))?;
+    fn fetch_raw_transaction(&self, _txid: &TxId) -> Result<Vec<u8>> {
+        // TODO: Use WalletRead API to get raw transaction bytes
+        //
+        // Pseudocode:
+        // 1. Look up transaction by txid using WalletRead trait
+        // 2. Return the raw serialized transaction bytes
+        //
+        // Possible approaches:
+        // - WalletRead::get_transaction() if available
+        // - The transaction should be stored after create_proposed_transactions()
+        // - May need to serialize from the Transaction struct if raw not stored
 
-        let raw: Vec<u8> = conn.query_row(
-            "SELECT raw FROM transactions WHERE txid = ?",
-            [txid.as_ref()],
-            |row| row.get(0),
-        ).map_err(|e| anyhow!("Failed to fetch raw transaction: {e}"))?;
-
-        Ok(raw)
+        Err(anyhow!("fetch_raw_transaction: Not implemented - needs WalletRead API"))
     }
 
     /// Run the block monitoring loop.
@@ -824,56 +773,21 @@ impl ZVS {
 
     /// Fetch all received memos regardless of processing state.
     async fn fetch_all_memos(&mut self) -> Result<Vec<ReceivedMemo>> {
-        let conn = Connection::open_with_flags(&self.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| anyhow!("Failed to open db: {e}"))?;
+        // TODO: Use WalletRead API to enumerate all received notes
+        //
+        // Pseudocode:
+        // 1. Get all received notes from wallet (both Sapling and Orchard)
+        // 2. For each note:
+        //    - Get txid, block height, value
+        //    - Decrypt memo using fetch_transaction_memo()
+        //    - Validate memo and extract verification data
+        // 3. Return list of ReceivedMemo structs
+        //
+        // This is similar to fetch_new_memos but without filtering
+        // for unprocessed notes.
 
-        let mut stmt = conn.prepare(
-            "SELECT t.txid, t.block, srn.value
-             FROM sapling_received_notes srn
-             JOIN transactions t ON srn.transaction_id = t.id_tx
-             ORDER BY srn.id ASC"
-        ).map_err(|e| anyhow!("Failed to prepare query: {e}"))?;
-
-        let rows: Vec<(Vec<u8>, Option<u32>, i64)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .map_err(|e| anyhow!("Failed to query: {e}"))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| anyhow!("Failed to collect: {e}"))?;
-
-        drop(stmt);
-        drop(conn);
-
-        let mut memos = Vec::new();
-
-        for (txid_bytes, block_height, value) in rows {
-            let txid_hex = hex::encode(&txid_bytes);
-            let height = block_height.unwrap_or(0);
-
-            let memo_text = match self.fetch_transaction_memo(&txid_bytes, height).await {
-                Ok(Some(text)) => text,
-                Ok(None) => String::new(),
-                Err(e) => {
-                    warn!("Failed to fetch memo for tx {}: {}", &txid_hex[..16], e);
-                    String::new()
-                }
-            };
-
-            let verification = if !memo_text.is_empty() {
-                validate_memo(&memo_text)
-            } else {
-                None
-            };
-
-            memos.push(ReceivedMemo {
-                txid_hex,
-                height,
-                memo: memo_text,
-                value_zats: value as u64,
-                verification,
-            });
-        }
-
-        Ok(memos)
+        warn!("fetch_all_memos: Not implemented - needs WalletRead API");
+        Ok(Vec::new())
     }
 }
 

@@ -29,7 +29,6 @@ zcash_note_encryption = "0.4"
 sapling-crypto = "0.5"
 zip32 = "0.2"
 secrecy = "0.8"
-rusqlite = "0.37"
 
 # TLS
 rustls = { version = "0.23", features = ["ring"] }
