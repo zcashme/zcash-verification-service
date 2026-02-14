@@ -1,30 +1,21 @@
 //! ZVS - Zcash Verification Service
 //!
-//! Streams mempool transactions and responds to verification requests in real-time.
+//! Streams mempool transactions and logs verification requests in real-time.
 
 use std::env;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use zcash_primitives::transaction::Transaction;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 
 mod memo_rules;
-mod otp_rules;
 mod scan;
-mod verification;
+mod sync;
 mod wallet;
 
 use wallet::Wallet;
-
-/// A transaction received from the mempool stream.
-struct MempoolTx {
-    tx: Transaction,
-    height: BlockHeight,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,15 +25,11 @@ async fn main() -> Result<()> {
 
     dotenvy::dotenv().ok();
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let url = env::var("LIGHTWALLETD_URL").expect("LIGHTWALLETD_URL required");
     let seed_hex = env::var("SEED_HEX").expect("SEED_HEX required");
-    let otp_secret_hex = env::var("OTP_SECRET").expect("OTP_SECRET required (hex-encoded)");
     let birthday_height: u32 = env::var("BIRTHDAY_HEIGHT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -52,7 +39,6 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| PathBuf::from("./zvs_data"));
 
     let seed = hex::decode(&seed_hex)?;
-    let otp_secret = hex::decode(&otp_secret_hex)?;
 
     println!("ZVS - Zcash Verification Service");
     println!("=================================");
@@ -61,7 +47,15 @@ async fn main() -> Result<()> {
     println!("Mode: Mempool streaming (real-time)");
     println!();
 
-    let mut wallet = Wallet::new(&url, &seed, birthday_height, &data_dir).await?;
+    // Connect to lightwalletd
+    info!("Connecting to lightwalletd at {}", url);
+    let mut client = CompactTxStreamerClient::connect(url.clone()).await?;
+
+    // Fetch birthday for wallet initialization (only needed if wallet.db doesn't exist)
+    let birthday = sync::fetch_birthday(&mut client, birthday_height).await?;
+
+    // Create wallet
+    let wallet = Wallet::new(&seed, Some(&birthday), &data_dir)?;
 
     match wallet.get_address() {
         Ok(address) => println!("Wallet address: {}", address),
@@ -83,7 +77,7 @@ async fn main() -> Result<()> {
     println!();
 
     tokio::select! {
-        result = run_mempool_service(&mut wallet, &otp_secret) => {
+        result = run_mempool_service(&mut client, &wallet) => {
             if let Err(e) = result {
                 eprintln!("Service error: {}", e);
             }
@@ -97,62 +91,36 @@ async fn main() -> Result<()> {
 }
 
 /// Run the mempool streaming service.
-///
-/// Uses a channel to decouple streaming from processing, avoiding borrow conflicts.
 async fn run_mempool_service(
-    wallet: &mut Wallet,
-    otp_secret: &[u8],
+    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    wallet: &Wallet,
 ) -> Result<()> {
     info!("Starting mempool streaming service");
 
     loop {
         info!("Connecting to mempool stream...");
 
-        // Clone the client for the streaming task
-        let mut stream_client = wallet.clone_client();
-
-        // Channel for passing transactions from stream to processor
-        let (tx_sender, mut tx_receiver) = mpsc::channel::<MempoolTx>(100);
-
-        // Spawn the stream task
-        let stream_handle = tokio::spawn(async move {
-            scan::stream_mempool(&mut stream_client, |tx, height| {
-                let sender = tx_sender.clone();
-                async move {
-                    if sender.send(MempoolTx { tx, height }).await.is_err() {
-                        return Err(anyhow::anyhow!("Processor stopped"));
-                    }
-                    Ok(())
-                }
-            }).await
-        });
-
-        // Process transactions as they arrive
-        while let Some(mempool_tx) = tx_receiver.recv().await {
+        let result = scan::stream_mempool(client, |tx, height| {
             // Decrypt memo using wallet
-            if let Some(memo) = wallet.decrypt_memo(&mempool_tx.tx, mempool_tx.height) {
-                // Handle the verification request
-                if let Err(e) = verification::handle_memo(wallet, &memo, otp_secret).await {
-                    error!("Failed to handle memo: {}", e);
-                }
+            if let Some(memo) = wallet.decrypt_memo(&tx, height) {
+                info!(
+                    "Verification request: {} (value={} zats, tx={})",
+                    memo.memo_text,
+                    u64::from(memo.value),
+                    hex::encode(memo.txid.as_ref())
+                );
             }
-        }
+            async { Ok(()) }
+        })
+        .await;
 
-        // Wait for stream task to finish
-        let stream_result = stream_handle.await;
-
-        match stream_result {
-            Ok(Ok(())) => {
+        match result {
+            Ok(()) => {
                 info!("Mempool stream closed, reconnecting in 500ms...");
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
-            Ok(Err(e)) => {
-                error!("Mempool stream error: {}", e);
-                warn!("Reconnecting in 30s...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-            }
             Err(e) => {
-                error!("Stream task panicked: {}", e);
+                error!("Mempool stream error: {}", e);
                 warn!("Reconnecting in 30s...");
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             }
