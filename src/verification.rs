@@ -1,65 +1,50 @@
 //! ZVS Verification Logic
 //!
-//! Pure functions for verification request handling.
-//! The wallet is owned by main.rs, not by this module.
+//! Handles verification requests by validating memos, generating OTPs,
+//! and sending responses. The wallet is passed in for sending transactions.
 
 use tracing::{error, info, warn};
 
-use crate::memo_rules::{is_valid_payment, MIN_PAYMENT};
+use crate::memo_rules::{is_valid_payment, validate_memo, MIN_PAYMENT};
 use crate::otp_rules::{create_otp_transaction_request, generate_otp, OtpResponseParams};
-use crate::wallet::{ReceivedMemo, Wallet};
+use crate::wallet::{DecryptedMemo, Wallet};
 
-/// A pending verification request with its generated OTP.
-#[derive(Debug, Clone)]
-pub struct PendingRequest {
-    pub session_id: String,
-    pub otp: String,
-    pub txid_hex: String,
-}
-
-/// Generate pending requests from memos.
-pub fn get_pending_requests(memos: &[ReceivedMemo], otp_secret: &[u8]) -> Vec<PendingRequest> {
-    memos
-        .iter()
-        .filter_map(|memo| {
-            memo.verification.as_ref().map(|v| PendingRequest {
-                session_id: v.session_id.clone(),
-                otp: generate_otp(otp_secret, &v.session_id),
-                txid_hex: memo.txid_hex.clone(),
-            })
-        })
-        .collect()
-}
-
-/// Handle a received memo - generate OTP and send response if valid.
+/// Handle a decrypted memo - validate, generate OTP, and send response if valid.
 ///
-/// Returns `true` if an OTP was sent, `false` otherwise.
+/// This is the main entry point called from main.rs for each decrypted memo.
+///
+/// Returns `Ok(())` on success (even if not a verification request),
+/// returns `Err` only on critical failures.
 pub async fn handle_memo(
     wallet: &mut Wallet,
-    memo: &ReceivedMemo,
+    memo: &DecryptedMemo,
     otp_secret: &[u8],
-) -> bool {
-    let Some(ref verification) = memo.verification else {
+) -> anyhow::Result<()> {
+    let txid_hex = hex::encode(memo.txid.as_ref());
+
+    // Check if this is a verification request
+    let Some(verification) = validate_memo(&memo.memo_text) else {
         // Not a verification request - just log if it has content
-        if !memo.memo.is_empty() {
+        if !memo.memo_text.is_empty() {
             info!(
                 "Memo received (not a verification request): \"{}\" (value={} zats, tx={})",
-                memo.memo.chars().take(50).collect::<String>(),
+                memo.memo_text.chars().take(50).collect::<String>(),
                 u64::from(memo.value),
-                memo.txid_hex
+                txid_hex
             );
         }
-        return false;
+        return Ok(());
     };
 
+    // Check minimum payment
     if !is_valid_payment(memo.value) {
         warn!(
             "Ignoring underpaid request: {} < {} zats minimum (tx={})",
             u64::from(memo.value),
             u64::from(MIN_PAYMENT),
-            memo.txid_hex
+            txid_hex
         );
-        return false;
+        return Ok(());
     }
 
     info!(
@@ -67,25 +52,21 @@ pub async fn handle_memo(
         verification.session_id,
         verification.user_address,
         u64::from(memo.value),
-        memo.txid_hex
+        txid_hex
     );
 
+    // Generate OTP
     let otp = generate_otp(otp_secret, &verification.session_id);
     info!("Generated OTP: {} for session: {}", otp, verification.session_id);
 
+    // Build and send response
     let params = OtpResponseParams {
         recipient_address: verification.user_address.clone(),
         otp_code: otp,
-        request_txid_hex: memo.txid_hex.clone(),
+        request_txid_hex: txid_hex.clone(),
     };
 
-    let request = match create_otp_transaction_request(&params) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to create OTP transaction request: {}", e);
-            return false;
-        }
-    };
+    let request = create_otp_transaction_request(&params)?;
 
     match wallet.send_transaction(request).await {
         Ok(response_txid) => {
@@ -93,11 +74,11 @@ pub async fn handle_memo(
                 "OTP sent successfully! Response tx: {}",
                 hex::encode(response_txid.as_ref())
             );
-            true
         }
         Err(e) => {
             error!("Failed to send OTP: {}", e);
-            false
         }
     }
+
+    Ok(())
 }

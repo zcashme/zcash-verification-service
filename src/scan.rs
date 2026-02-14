@@ -1,153 +1,87 @@
-//! Memo decryption utilities for ZVS.
+//! Mempool streaming client for ZVS.
 //!
-//! This module handles decrypting memos from full Zcash transactions using
-//! the unified `decrypt_transaction` API from zcash_client_backend.
+//! This module connects to lightwalletd's GetMempoolStream and yields
+//! parsed transactions. It does NOT handle decryption - that's wallet's job.
 
-use std::collections::HashMap;
+use anyhow::{anyhow, Result};
+use tonic::transport::Channel;
+use tracing::{debug, info, warn};
 
-use anyhow::Result;
-use tracing::debug;
-
-use zcash_client_backend::{decrypt_transaction, TransferType};
-use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_primitives::transaction::Transaction;
-use zcash_protocol::{
-    consensus::{BlockHeight, MainNetwork},
-    memo::{Memo, MemoBytes},
-    value::Zatoshis,
+use zcash_client_backend::proto::service::{
+    compact_tx_streamer_client::CompactTxStreamerClient, Empty,
 };
+use zcash_primitives::transaction::Transaction;
+use zcash_protocol::consensus::{BlockHeight, BranchId, MainNetwork};
 
-/// A decrypted memo with its associated value.
-#[derive(Debug, Clone)]
-pub struct DecryptedMemo {
-    /// The memo text (empty string if no text memo).
-    pub memo_text: String,
-    /// The value of the note in zatoshis.
-    pub value: Zatoshis,
-    /// Whether this is an incoming payment (vs change or outgoing).
-    pub is_incoming: bool,
-}
-
-/// Decrypt all memos from a transaction using the unified API.
+/// Stream mempool transactions from lightwalletd.
 ///
-/// This function handles both Sapling and Orchard outputs in a single call.
-/// It only returns incoming transfers (not change or outgoing).
+/// Connects to GetMempoolStream and calls the handler for each parsed transaction.
+/// Returns Ok(()) when the stream closes normally (new block mined).
+/// Returns Err on connection or parsing errors.
 ///
 /// # Parameters
-/// - `tx`: The transaction to decrypt
-/// - `ufvk`: The unified full viewing key to use for decryption
-/// - `block_height`: The height at which the transaction was mined
-///
-/// # Returns
-/// A vector of decrypted memos with their values, filtered to only incoming transfers.
-pub fn decrypt_memos(
-    tx: &Transaction,
-    ufvk: &UnifiedFullViewingKey,
-    block_height: BlockHeight,
-) -> Result<Vec<DecryptedMemo>> {
-    // Build the UFVK map (we only have one account)
-    let mut ufvks = HashMap::new();
-    ufvks.insert(0u32, ufvk.clone());
+/// - `client`: The gRPC client connected to lightwalletd
+/// - `handler`: Called for each successfully parsed transaction
+pub async fn stream_mempool<F, Fut>(
+    client: &mut CompactTxStreamerClient<Channel>,
+    mut handler: F,
+) -> Result<()>
+where
+    F: FnMut(Transaction, BlockHeight) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    info!("Connecting to mempool stream...");
 
-    // Use the unified decrypt_transaction API
-    let decrypted = decrypt_transaction(
-        &MainNetwork,
-        Some(block_height),
-        None, // chain_tip not needed for mined transactions
-        tx,
-        &ufvks,
-    );
+    let response = client
+        .get_mempool_stream(Empty {})
+        .await
+        .map_err(|e| anyhow!("Failed to connect to mempool stream: {}", e))?;
 
-    let mut results = Vec::new();
+    let mut stream = response.into_inner();
 
-    // Process Sapling outputs
-    for output in decrypted.sapling_outputs() {
-        // Only process incoming transfers (not change or outgoing)
-        if !matches!(output.transfer_type(), TransferType::Incoming) {
-            continue;
+    info!("Connected to mempool stream");
+
+    loop {
+        match stream.message().await {
+            Ok(Some(raw_tx)) => {
+                // Parse the raw transaction
+                let height = if raw_tx.height == 0 {
+                    // Mempool transactions have height 0, use a recent height for branch ID
+                    // This is safe because we only need it for transaction parsing
+                    BlockHeight::from_u32(2_600_000)
+                } else {
+                    BlockHeight::from_u32(raw_tx.height as u32)
+                };
+
+                let branch_id = BranchId::for_height(&MainNetwork, height);
+
+                match Transaction::read(&raw_tx.data[..], branch_id) {
+                    Ok(tx) => {
+                        let txid = tx.txid();
+                        debug!("Received mempool tx: {}", hex::encode(txid.as_ref()));
+
+                        if let Err(e) = handler(tx, height).await {
+                            warn!("Handler error for tx {}: {}", hex::encode(txid.as_ref()), e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse mempool transaction: {}", e);
+                    }
+                }
+            }
+            Ok(None) => {
+                // Stream closed normally (new block mined)
+                info!("Mempool stream closed (new block)");
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(anyhow!("Mempool stream error: {}", e));
+            }
         }
-
-        let memo_text = extract_memo_text(output.memo());
-        let value = output.note_value();
-
-        if !memo_text.is_empty() {
-            debug!("Decrypted Sapling memo: {}", memo_text);
-        }
-
-        results.push(DecryptedMemo {
-            memo_text,
-            value,
-            is_incoming: true,
-        });
     }
-
-    // Process Orchard outputs
-    for output in decrypted.orchard_outputs() {
-        // Only process incoming transfers (not change or outgoing)
-        if !matches!(output.transfer_type(), TransferType::Incoming) {
-            continue;
-        }
-
-        let memo_text = extract_memo_text(output.memo());
-        let value = output.note_value();
-
-        if !memo_text.is_empty() {
-            debug!("Decrypted Orchard memo: {}", memo_text);
-        }
-
-        results.push(DecryptedMemo {
-            memo_text,
-            value,
-            is_incoming: true,
-        });
-    }
-
-    Ok(results)
-}
-
-/// Extract UTF-8 text from MemoBytes.
-///
-/// Per ZIP-302:
-/// - Empty memos return empty string
-/// - Text memos are extracted as UTF-8
-pub fn extract_memo_text(memo_bytes: &MemoBytes) -> String {
-    match Memo::try_from(memo_bytes.clone()) {
-        Ok(Memo::Text(text)) => text.to_string(),
-        Ok(Memo::Empty) => String::new(),
-        Ok(Memo::Future(_)) => String::new(),
-        Ok(Memo::Arbitrary(_)) => String::new(),
-        Err(_) => String::new(),
-    }
-}
-
-/// Convenience function to get the first non-empty memo from a transaction.
-///
-/// This is useful when you expect a single memo per transaction (like ZVS verification).
-pub fn decrypt_first_memo(
-    tx: &Transaction,
-    ufvk: &UnifiedFullViewingKey,
-    block_height: BlockHeight,
-) -> Result<Option<DecryptedMemo>> {
-    let memos = decrypt_memos(tx, ufvk, block_height)?;
-
-    // Return the first memo with non-empty text
-    Ok(memos.into_iter().find(|m| !m.memo_text.is_empty()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_memo_text_empty() {
-        let memo = MemoBytes::empty();
-        assert_eq!(extract_memo_text(&memo), "");
-    }
-
-    #[test]
-    fn test_extract_memo_text_with_content() {
-        let memo = MemoBytes::from_bytes(b"pineapple").unwrap();
-        // Note: MemoBytes::from_bytes pads to 512 bytes, so this tests the parsing
-        assert!(extract_memo_text(&memo).starts_with("pineapple"));
-    }
+    // Tests would require a mock gRPC server
 }

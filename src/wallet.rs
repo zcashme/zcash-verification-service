@@ -1,9 +1,10 @@
 //! ZVS Wallet - Core wallet implementation for Zcash operations.
 //!
 //! This module provides a complete wallet abstraction over zcash_client_sqlite,
-//! handling account management, mempool streaming, transaction building, and
-//! memo decryption.
+//! handling account management, transaction building, memo decryption, and
+//! sending transactions.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::Path;
 
@@ -20,12 +21,14 @@ use zcash_client_backend::{
         },
         AccountBirthday, WalletRead, WalletWrite,
     },
+    decrypt_transaction,
     proto::service::{
         compact_tx_streamer_client::CompactTxStreamerClient, BlockId, ChainSpec,
         RawTransaction, TxFilter,
     },
     wallet::OvkPolicy,
     zip321::TransactionRequest,
+    TransferType,
 };
 use zcash_client_sqlite::{util::SystemClock, wallet::init::init_wallet_db, AccountUuid, WalletDb};
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
@@ -33,12 +36,15 @@ use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
     consensus::{BlockHeight, MainNetwork},
+    memo::{Memo, MemoBytes},
     value::Zatoshis,
 };
 
-use crate::memo_rules::{validate_memo, VerificationData};
 use crate::otp_rules::create_change_strategy;
-use crate::scan::decrypt_first_memo;
+
+// =============================================================================
+// Types
+// =============================================================================
 
 /// Account balance breakdown.
 #[derive(Debug, Clone)]
@@ -54,13 +60,12 @@ impl Default for AccountBalance {
     }
 }
 
-/// A received memo with metadata.
+/// A decrypted memo with its associated value.
 #[derive(Debug, Clone)]
-pub struct ReceivedMemo {
-    pub txid_hex: String,
-    pub memo: String,
+pub struct DecryptedMemo {
+    pub txid: TxId,
+    pub memo_text: String,
     pub value: Zatoshis,
-    pub verification: Option<VerificationData>,
 }
 
 /// Transaction send result.
@@ -72,6 +77,10 @@ pub struct SendResult {
 
 /// The wallet database type used throughout ZVS.
 pub type WalletDbType = WalletDb<rusqlite::Connection, MainNetwork, SystemClock, rand::rngs::OsRng>;
+
+// =============================================================================
+// Wallet
+// =============================================================================
 
 /// ZVS Wallet - handles all Zcash wallet operations.
 pub struct Wallet {
@@ -136,6 +145,18 @@ impl Wallet {
             usk,
             birthday_height,
         })
+    }
+
+    // =========================================================================
+    // Client Access (for scan::stream_mempool)
+    // =========================================================================
+
+    /// Clone the gRPC client for use in a separate task.
+    ///
+    /// Used by scan::stream_mempool to connect to the mempool stream
+    /// without holding a borrow on the wallet.
+    pub fn clone_client(&self) -> CompactTxStreamerClient<Channel> {
+        self.client.clone()
     }
 
     // =========================================================================
@@ -212,76 +233,72 @@ impl Wallet {
     }
 
     // =========================================================================
-    // Memo Methods
+    // Memo Decryption Methods
     // =========================================================================
 
-    /// Fetch a transaction from lightwalletd, decrypt memo, and store enhanced data.
-    async fn fetch_and_process_transaction(&mut self, txid: &TxId) -> Result<Option<ReceivedMemo>> {
-        let txid_bytes = txid.as_ref().to_vec();
-        let txid_hex = hex::encode(&txid_bytes);
-
-        debug!("Fetching transaction {} for memo", txid_hex);
-
-        // Fetch raw transaction
-        let tx_filter = TxFilter {
-            block: None,
-            index: 0,
-            hash: txid_bytes.clone(),
-        };
-
-        let raw_tx = self
-            .client
-            .get_transaction(tx_filter)
-            .await
-            .map_err(|e| anyhow!("Failed to fetch transaction: {e}"))?
-            .into_inner();
-
-        if raw_tx.data.is_empty() {
-            return Err(anyhow!("Empty transaction data"));
-        }
-
-        // Get height for this transaction (use current tip as approximation)
-        let height = raw_tx.height as u32;
-        let block_height = BlockHeight::from_u32(height);
-        let branch_id =
-            zcash_primitives::consensus::BranchId::for_height(&MainNetwork, block_height);
-
-        // Parse transaction
-        let tx = Transaction::read(&raw_tx.data[..], branch_id)
-            .map_err(|e| anyhow!("Failed to parse transaction: {e}"))?;
-
-        // Store enhanced transaction data in wallet
-        self.db
-            .set_transaction_status(*txid, zcash_client_backend::data_api::TransactionStatus::Mined(block_height))
-            .map_err(|e| anyhow!("Failed to store transaction: {e}"))?;
-
-        // Decrypt memo using unified API (handles both Sapling and Orchard)
+    /// Decrypt memos from a transaction.
+    ///
+    /// Uses the wallet's viewing key to decrypt any outputs addressed to us.
+    /// Returns only incoming transfers (not change or outgoing).
+    pub fn decrypt_memo(&self, tx: &Transaction, height: BlockHeight) -> Option<DecryptedMemo> {
         let ufvk = self.usk.to_unified_full_viewing_key();
 
-        if let Some(decrypted) = decrypt_first_memo(&tx, &ufvk, block_height)? {
-            let verification = validate_memo(&decrypted.memo_text);
+        // Build the UFVK map (we only have one account)
+        let mut ufvks = HashMap::new();
+        ufvks.insert(0u32, ufvk);
 
-            return Ok(Some(ReceivedMemo {
-                txid_hex,
-                memo: decrypted.memo_text,
-                value: decrypted.value, // Value now comes from decryption
-                verification,
-            }));
+        // Use the unified decrypt_transaction API from zcash_client_backend
+        let decrypted = decrypt_transaction(
+            &MainNetwork,
+            Some(height),
+            None, // chain_tip not needed for mempool
+            tx,
+            &ufvks,
+        );
+
+        // Process Sapling outputs first
+        for output in decrypted.sapling_outputs() {
+            if !matches!(output.transfer_type(), TransferType::Incoming) {
+                continue;
+            }
+
+            let memo_text = extract_memo_text(output.memo());
+            if !memo_text.is_empty() {
+                debug!("Decrypted Sapling memo: {}", memo_text);
+                return Some(DecryptedMemo {
+                    txid: tx.txid(),
+                    memo_text,
+                    value: output.note_value(),
+                });
+            }
         }
 
-        Ok(None)
+        // Process Orchard outputs
+        for output in decrypted.orchard_outputs() {
+            if !matches!(output.transfer_type(), TransferType::Incoming) {
+                continue;
+            }
+
+            let memo_text = extract_memo_text(output.memo());
+            if !memo_text.is_empty() {
+                debug!("Decrypted Orchard memo: {}", memo_text);
+                return Some(DecryptedMemo {
+                    txid: tx.txid(),
+                    memo_text,
+                    value: output.note_value(),
+                });
+            }
+        }
+
+        None
     }
 
     // =========================================================================
     // Transaction Methods
     // =========================================================================
 
-    /// Fetch raw transaction bytes from the wallet or lightwalletd.
+    /// Fetch raw transaction bytes from lightwalletd.
     pub async fn fetch_raw_transaction(&mut self, txid: &TxId) -> Result<Vec<u8>> {
-        // First try to get from wallet database
-        // The transaction should be stored after create_proposed_transactions()
-
-        // If not in wallet, fetch from lightwalletd
         let tx_filter = TxFilter {
             block: None,
             index: 0,
@@ -381,5 +398,24 @@ impl Wallet {
         let result = self.create_transaction(request).await?;
         self.broadcast_transaction(result.raw_tx).await?;
         Ok(result.txid)
+    }
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Extract UTF-8 text from MemoBytes.
+///
+/// Per ZIP-302:
+/// - Empty memos return empty string
+/// - Text memos are extracted as UTF-8
+fn extract_memo_text(memo_bytes: &MemoBytes) -> String {
+    match Memo::try_from(memo_bytes.clone()) {
+        Ok(Memo::Text(text)) => text.to_string(),
+        Ok(Memo::Empty) => String::new(),
+        Ok(Memo::Future(_)) => String::new(),
+        Ok(Memo::Arbitrary(_)) => String::new(),
+        Err(_) => String::new(),
     }
 }
