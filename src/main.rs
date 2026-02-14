@@ -58,12 +58,17 @@ async fn main() -> Result<()> {
     let birthday = sync::fetch_birthday(&mut client, birthday_height).await?;
 
     // Create wallet
-    let wallet = Wallet::new(&seed, Some(&birthday), &data_dir)?;
+    let mut wallet = Wallet::new(&seed, Some(&birthday), &data_dir)?;
 
     match wallet.get_address() {
         Ok(address) => println!("Wallet address: {}", address),
         Err(e) => println!("Could not get address: {}", e),
     }
+    println!();
+
+    // Sync wallet
+    println!("Syncing wallet...");
+    wallet.sync(&mut client).await?;
 
     match wallet.get_balance() {
         Ok(balance) => {
@@ -71,7 +76,7 @@ async fn main() -> Result<()> {
             let total_zec = total_zats as f64 / 100_000_000.0;
             println!("Balance: {:.8} ZEC ({} zats)", total_zec, total_zats);
         }
-        Err(_) => println!("Balance: (wallet not synced yet)"),
+        Err(e) => println!("Balance error: {}", e),
     }
     println!();
 

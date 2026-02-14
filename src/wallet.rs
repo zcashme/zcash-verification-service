@@ -124,6 +124,32 @@ impl Wallet {
         &mut self.db
     }
 
+    /// Sync wallet with the blockchain.
+    ///
+    /// Downloads compact blocks and scans for relevant transactions.
+    /// Uses in-memory block cache (re-downloads on each run).
+    pub async fn sync(
+        &mut self,
+        client: &mut zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient<tonic::transport::Channel>,
+    ) -> Result<()> {
+        let db_cache = crate::sync::MemBlockCache::new();
+
+        info!("Starting wallet sync...");
+
+        zcash_client_backend::sync::run(
+            client,
+            &MainNetwork,
+            &db_cache,
+            &mut self.db,
+            10_000, // batch size
+        )
+        .await
+        .map_err(|e| anyhow!("Sync failed: {:?}", e))?;
+
+        info!("Wallet sync complete");
+        Ok(())
+    }
+
     // =========================================================================
     // Address Methods
     // =========================================================================
