@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 
 mod memo_rules;
+mod otp_rules;
 mod scan;
 mod sync;
 mod wallet;
@@ -37,8 +38,10 @@ async fn main() -> Result<()> {
     let data_dir = env::var("ZVS_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./zvs_data"));
+    let otp_secret = env::var("OTP_SECRET").expect("OTP_SECRET required");
 
     let seed = hex::decode(&seed_hex)?;
+    let otp_secret_bytes = hex::decode(&otp_secret)?;
 
     println!("ZVS - Zcash Verification Service");
     println!("=================================");
@@ -77,7 +80,7 @@ async fn main() -> Result<()> {
     println!();
 
     tokio::select! {
-        result = run_mempool_service(&mut client, &wallet) => {
+        result = run_mempool_service(&mut client, &wallet, &otp_secret_bytes) => {
             if let Err(e) = result {
                 eprintln!("Service error: {}", e);
             }
@@ -94,6 +97,7 @@ async fn main() -> Result<()> {
 async fn run_mempool_service(
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
     wallet: &Wallet,
+    otp_secret: &[u8],
 ) -> Result<()> {
     info!("Starting mempool streaming service");
 
@@ -102,13 +106,38 @@ async fn run_mempool_service(
 
         let result = scan::stream_mempool(client, |tx, height| {
             // Decrypt memo using wallet
-            if let Some(memo) = wallet.decrypt_memo(&tx, height) {
-                info!(
-                    "Verification request: {} (value={} zats, tx={})",
-                    memo.memo_text,
-                    u64::from(memo.value),
-                    hex::encode(memo.txid.as_ref())
-                );
+            if let Some(decrypted) = wallet.decrypt_memo(&tx, height) {
+                let txid_hex = hex::encode(decrypted.txid.as_ref());
+
+                // Validate memo format
+                if let Some(verification) = memo_rules::validate_memo(&decrypted.memo_text) {
+                    // Check payment amount
+                    if memo_rules::is_valid_payment(decrypted.value) {
+                        // Generate OTP
+                        let otp = otp_rules::generate_otp(otp_secret, &verification.session_id);
+                        let response_memo = otp_rules::build_otp_memo(&otp, &txid_hex);
+
+                        info!("=== VERIFICATION REQUEST ===");
+                        info!("Session: {}", verification.session_id);
+                        info!("Payment: {} zats ✓", u64::from(decrypted.value));
+                        info!("Request tx: {}", txid_hex);
+                        info!("Generated OTP: {}", otp);
+                        info!("Response memo: {}", response_memo);
+                        info!("Reply to: {}", verification.user_address);
+                        info!("[DRY RUN] Would send {} zats to {}",
+                            u64::from(memo_rules::RESPONSE_AMOUNT),
+                            verification.user_address
+                        );
+                        info!("============================");
+                    } else {
+                        warn!(
+                            "Payment too low: {} zats < {} minimum (tx={})",
+                            u64::from(decrypted.value),
+                            u64::from(memo_rules::MIN_PAYMENT),
+                            txid_hex
+                        );
+                    }
+                }
             }
             async { Ok(()) }
         })
