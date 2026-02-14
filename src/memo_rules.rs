@@ -1,10 +1,21 @@
 //! Memo validation for ZVS verification requests.
 
+/// Minimum payment required for a verification request (in zatoshis).
+pub const MIN_PAYMENT_ZATS: u64 = 2_000;
+
+/// Amount sent back with OTP response (in zatoshis).
+pub const RESPONSE_AMOUNT_ZATS: u64 = 1_000;
+
 /// Extracted verification data from a valid ZVS memo.
 #[derive(Debug, Clone)]
 pub struct VerificationData {
     pub session_id: String,
     pub user_address: String,
+}
+
+/// Check if payment meets minimum threshold.
+pub fn is_valid_payment(value_zats: u64) -> bool {
+    value_zats >= MIN_PAYMENT_ZATS
 }
 
 /// Parse and validate a ZVS verification memo.

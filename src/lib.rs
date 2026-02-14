@@ -27,7 +27,7 @@ use zcash_client_backend::{
         compact_formats::CompactBlock,
         service::{
             compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
-            RawTransaction, TxFilter,
+            RawTransaction,
         },
     },
     wallet::OvkPolicy,
@@ -52,7 +52,10 @@ use zcash_address::ZcashAddress;
 type HmacSha256 = Hmac<Sha256>;
 
 pub mod memo_rules;
-pub use memo_rules::{validate_memo, VerificationData};
+pub mod scan;
+
+pub use memo_rules::{validate_memo, is_valid_payment, VerificationData, MIN_PAYMENT_ZATS, RESPONSE_AMOUNT_ZATS};
+pub use scan::{extract_memo_text, fetch_and_decrypt_memo};
 
 /// In-memory cache for compact blocks during sync.
 pub struct MemoryBlockSource {
@@ -469,73 +472,12 @@ impl ZVS {
     }
 
     async fn fetch_new_memos(&mut self) -> Result<Vec<ReceivedMemo>> {
-        // TODO: Use WalletRead API to get received notes
+        // TODO: Implement using zcash_client_backend's transaction_data_requests()
+        // and decrypt_and_store_transaction() to properly enhance notes with memos.
         //
-        // Pseudocode:
-        // 1. Get all received notes from wallet using WalletRead trait methods
-        // 2. Filter to notes we haven't responded to yet (need to track processed txids)
-        // 3. For each note:
-        //    - Get txid, block height, value
-        //    - Decrypt memo using fetch_transaction_memo()
-        //    - Validate memo and extract verification data
-        // 4. Return list of ReceivedMemo structs
-        //
-        // Required WalletRead methods to investigate:
-        // - get_known_ephemeral_addresses()
-        // - get_notes() or similar for received note enumeration
-        // - May need to iterate through transactions and extract notes
-
-        warn!("fetch_new_memos: Not implemented - needs WalletRead API");
+        // For now, this is a stub - memos will be fetched on-demand when needed.
+        debug!("fetch_new_memos: Not yet implemented");
         Ok(Vec::new())
-    }
-
-    async fn fetch_transaction_memo(&mut self, txid: &[u8], height: u32) -> Result<Option<String>> {
-        let tx_filter = TxFilter { block: None, index: 0, hash: txid.to_vec() };
-
-        let raw_tx = self.client.get_transaction(tx_filter).await
-            .map_err(|e| anyhow!("Failed to fetch transaction: {e}"))?
-            .into_inner();
-
-        if raw_tx.data.is_empty() {
-            return Err(anyhow!("Empty transaction data"));
-        }
-
-        let block_height = BlockHeight::from_u32(height);
-        let branch_id = zcash_primitives::consensus::BranchId::for_height(&MainNetwork, block_height);
-
-        let tx = zcash_primitives::transaction::Transaction::read(&raw_tx.data[..], branch_id)
-            .map_err(|e| anyhow!("Failed to parse transaction: {e}"))?;
-
-        let ufvk = self.usk.to_unified_full_viewing_key();
-
-        if let Some(sapling_dfvk) = ufvk.sapling() {
-            if let Some(bundle) = tx.sapling_bundle() {
-                let ivk = sapling_dfvk.to_ivk(zip32::Scope::External);
-                let prepared_ivk = sapling_crypto::keys::PreparedIncomingViewingKey::new(&ivk);
-
-                // ZIP-212 activated at Canopy (mainnet height 1046400)
-                let zip212 = if u32::from(block_height) >= 1_046_400 {
-                    sapling_crypto::note_encryption::Zip212Enforcement::On
-                } else {
-                    sapling_crypto::note_encryption::Zip212Enforcement::Off
-                };
-
-                for output in bundle.shielded_outputs() {
-                    let domain = sapling_crypto::note_encryption::SaplingDomain::new(zip212);
-
-                    if let Some((_note, _address, memo_bytes)) =
-                        zcash_note_encryption::try_note_decryption(&domain, &prepared_ivk, output)
-                    {
-                        let memo_text = extract_memo_text(&memo_bytes);
-                        if !memo_text.is_empty() {
-                            return Ok(Some(memo_text));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(None)
     }
 
     /// Send OTP response to the user's address.
@@ -567,9 +509,7 @@ impl ZVS {
                 .map_err(|e| anyhow!("Invalid memo: {e}"))?
         );
 
-        // Minimum amount: 1000 zatoshis (0.00001 ZEC)
-        // Keep low to minimize total cost (send + fee)
-        let amount = Zatoshis::from_u64(1_000)
+        let amount = Zatoshis::from_u64(RESPONSE_AMOUNT_ZATS)
             .map_err(|_| anyhow!("Invalid amount"))?;
 
         // Create payment request
@@ -732,6 +672,14 @@ impl ZVS {
     /// Handle a received memo - generate OTP and send response if valid verification request.
     async fn handle_memo(&mut self, memo: ReceivedMemo) {
         if let Some(ref verification) = memo.verification {
+            if !is_valid_payment(memo.value_zats) {
+                warn!(
+                    "Ignoring underpaid request: {} zats < {} minimum (tx={})",
+                    memo.value_zats, MIN_PAYMENT_ZATS, memo.txid_hex
+                );
+                return;
+            }
+
             info!(
                 "VERIFICATION REQUEST: session={}, reply_to={}, value={} zats, tx={}",
                 verification.session_id, verification.user_address, memo.value_zats, memo.txid_hex
@@ -773,30 +721,9 @@ impl ZVS {
 
     /// Fetch all received memos regardless of processing state.
     async fn fetch_all_memos(&mut self) -> Result<Vec<ReceivedMemo>> {
-        // TODO: Use WalletRead API to enumerate all received notes
-        //
-        // Pseudocode:
-        // 1. Get all received notes from wallet (both Sapling and Orchard)
-        // 2. For each note:
-        //    - Get txid, block height, value
-        //    - Decrypt memo using fetch_transaction_memo()
-        //    - Validate memo and extract verification data
-        // 3. Return list of ReceivedMemo structs
-        //
-        // This is similar to fetch_new_memos but without filtering
-        // for unprocessed notes.
-
-        warn!("fetch_all_memos: Not implemented - needs WalletRead API");
+        // TODO: Implement using zcash_client_backend's WalletRead API
+        // to enumerate received notes and their memos.
+        debug!("fetch_all_memos: Not yet implemented");
         Ok(Vec::new())
     }
-}
-
-fn extract_memo_text(memo_bytes: &[u8; 512]) -> String {
-    // 0xF6 = empty memo per ZIP-302
-    if memo_bytes[0] == 0xF6 {
-        return String::new();
-    }
-
-    let end = memo_bytes.iter().position(|&b| b == 0).unwrap_or(512);
-    String::from_utf8_lossy(&memo_bytes[..end]).trim().to_string()
 }
