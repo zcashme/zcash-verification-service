@@ -61,7 +61,7 @@ pub async fn fetch_and_decrypt_memo(
 }
 
 /// Decrypt memo from Sapling outputs in a transaction.
-fn decrypt_sapling_memo(
+pub fn decrypt_sapling_memo(
     tx: &Transaction,
     ufvk: &UnifiedFullViewingKey,
     block_height: BlockHeight,
@@ -104,7 +104,7 @@ fn decrypt_sapling_memo(
 }
 
 /// Decrypt memo from Orchard actions in a transaction.
-fn decrypt_orchard_memo(
+pub fn decrypt_orchard_memo(
     tx: &Transaction,
     ufvk: &UnifiedFullViewingKey,
 ) -> Result<Option<String>> {

@@ -5,10 +5,6 @@ edition = "2021"
 description = "Zcash Verification Service"
 license = "MIT"
 
-[lib]
-name = "zvs"
-path = "src/lib.rs"
-
 [[bin]]
 name = "zvs"
 path = "src/main.rs"
