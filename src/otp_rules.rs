@@ -19,7 +19,7 @@ use zcash_protocol::{
     ShieldedProtocol,
 };
 
-use crate::memo_rules::RESPONSE_AMOUNT_ZATS;
+use crate::memo_rules::RESPONSE_AMOUNT;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -74,8 +74,7 @@ pub fn create_otp_transaction_request(params: &OtpResponseParams) -> Result<Tran
             .map_err(|e| anyhow!("Invalid memo: {e}"))?
     );
 
-    let amount = Zatoshis::from_u64(RESPONSE_AMOUNT_ZATS)
-        .map_err(|_| anyhow!("Invalid amount"))?;
+    let amount = RESPONSE_AMOUNT;
 
     let payment = Payment::new(
         recipient.into(),

@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tracing::{debug, error, info, warn};
 
-use crate::memo_rules::{is_valid_payment, MIN_PAYMENT_ZATS};
+use crate::memo_rules::{is_valid_payment, MIN_PAYMENT};
 use crate::otp_rules::{create_otp_transaction_request, generate_otp, OtpResponseParams};
 use crate::wallet::{ReceivedMemo, SyncResult, Wallet};
 
@@ -137,17 +137,17 @@ impl VerificationService {
     /// Handle a received memo - generate OTP and send response if valid.
     async fn handle_memo(&mut self, memo: ReceivedMemo) {
         if let Some(ref verification) = memo.verification {
-            if !is_valid_payment(memo.value_zats) {
+            if !is_valid_payment(memo.value) {
                 warn!(
-                    "Ignoring underpaid request: {} zats < {} minimum (tx={})",
-                    memo.value_zats, MIN_PAYMENT_ZATS, memo.txid_hex
+                    "Ignoring underpaid request: {} < {} zats minimum (tx={})",
+                    u64::from(memo.value), u64::from(MIN_PAYMENT), memo.txid_hex
                 );
                 return;
             }
 
             info!(
                 "VERIFICATION REQUEST: session={}, reply_to={}, value={} zats, tx={}",
-                verification.session_id, verification.user_address, memo.value_zats, memo.txid_hex
+                verification.session_id, verification.user_address, u64::from(memo.value), memo.txid_hex
             );
 
             let otp = self.generate_otp(&verification.session_id);
@@ -168,7 +168,7 @@ impl VerificationService {
             info!(
                 "Memo received (not a verification request): \"{}\" (value={} zats, tx={})",
                 memo.memo.chars().take(50).collect::<String>(),
-                memo.value_zats,
+                u64::from(memo.value),
                 memo.txid_hex
             );
         }

@@ -36,7 +36,10 @@ use zcash_client_sqlite::{util::SystemClock, wallet::init::init_wallet_db, Accou
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::consensus::{BlockHeight, MainNetwork};
+use zcash_protocol::{
+    consensus::{BlockHeight, MainNetwork},
+    value::Zatoshis,
+};
 
 use crate::memo_rules::{validate_memo, VerificationData};
 use crate::otp_rules::create_change_strategy;
@@ -114,9 +117,17 @@ impl BlockSource for MemoryBlockSource {
 }
 
 /// Account balance breakdown.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AccountBalance {
-    pub total: u64,
+    pub total: Zatoshis,
+}
+
+impl Default for AccountBalance {
+    fn default() -> Self {
+        Self {
+            total: Zatoshis::ZERO,
+        }
+    }
 }
 
 /// A received memo with metadata.
@@ -124,7 +135,7 @@ pub struct AccountBalance {
 pub struct ReceivedMemo {
     pub txid_hex: String,
     pub memo: String,
-    pub value_zats: u64,
+    pub value: Zatoshis,
     pub verification: Option<VerificationData>,
 }
 
@@ -257,7 +268,7 @@ impl Wallet {
             .ok_or_else(|| anyhow!("Account not found"))?;
 
         Ok(AccountBalance {
-            total: u64::from(balance.total()),
+            total: balance.total(),
         })
     }
 
@@ -520,12 +531,12 @@ impl Wallet {
         if let Some(memo_text) = decrypt_sapling_memo(&tx, &ufvk, block_height)? {
             if !memo_text.is_empty() {
                 let verification = validate_memo(&memo_text);
-                let value_zats = self.get_transaction_value(txid)?;
+                let value = self.get_transaction_value(txid)?;
 
                 return Ok(Some(ReceivedMemo {
                     txid_hex,
                     memo: memo_text,
-                    value_zats,
+                    value,
                     verification,
                 }));
             }
@@ -535,12 +546,12 @@ impl Wallet {
         if let Some(memo_text) = decrypt_orchard_memo(&tx, &ufvk)? {
             if !memo_text.is_empty() {
                 let verification = validate_memo(&memo_text);
-                let value_zats = self.get_transaction_value(txid)?;
+                let value = self.get_transaction_value(txid)?;
 
                 return Ok(Some(ReceivedMemo {
                     txid_hex: txid_hex.clone(),
                     memo: memo_text,
-                    value_zats,
+                    value,
                     verification,
                 }));
             }
@@ -550,10 +561,10 @@ impl Wallet {
     }
 
     /// Get total received value for a transaction.
-    fn get_transaction_value(&self, _txid: &TxId) -> Result<u64> {
+    fn get_transaction_value(&self, _txid: &TxId) -> Result<Zatoshis> {
         // TODO: Query received notes for this txid and sum values
-        // For now return 0, the actual value should come from the note decryption
-        Ok(0)
+        // For now return ZERO, the actual value should come from the note decryption
+        Ok(Zatoshis::ZERO)
     }
 
     /// Fetch all memos (for display purposes).

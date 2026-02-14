@@ -69,8 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match service.get_balance() {
         Ok(balance) => {
-            let total_zec = balance.total as f64 / 100_000_000.0;
-            println!("Balance: {:.8} ZEC ({} zats)", total_zec, balance.total);
+            let total_zats = u64::from(balance.total);
+            let total_zec = total_zats as f64 / 100_000_000.0;
+            println!("Balance: {:.8} ZEC ({} zats)", total_zec, total_zats);
         }
         Err(_) => println!("Balance: (wallet not synced yet)"),
     }
