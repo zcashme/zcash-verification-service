@@ -1,33 +1,28 @@
 //! ZVS Wallet - Core wallet implementation for Zcash operations.
 //!
 //! This module provides a complete wallet abstraction over zcash_client_sqlite,
-//! handling account management, synchronization, transaction building, and
+//! handling account management, mempool streaming, transaction building, and
 //! memo decryption.
 
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use secrecy::Secret;
 use tonic::transport::Channel;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use zcash_client_backend::{
     data_api::{
-        chain::{scan_cached_blocks, BlockSource, ChainState},
         wallet::{
             create_proposed_transactions, input_selection::GreedyInputSelector, propose_transfer,
             ConfirmationsPolicy, SpendingKeys,
         },
         AccountBirthday, WalletRead, WalletWrite,
     },
-    proto::{
-        compact_formats::CompactBlock,
-        service::{
-            compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
-            RawTransaction, TxFilter,
-        },
+    proto::service::{
+        compact_tx_streamer_client::CompactTxStreamerClient, BlockId, ChainSpec,
+        RawTransaction, TxFilter,
     },
     wallet::OvkPolicy,
     zip321::TransactionRequest,
@@ -44,77 +39,6 @@ use zcash_protocol::{
 use crate::memo_rules::{validate_memo, VerificationData};
 use crate::otp_rules::create_change_strategy;
 use crate::scan::{decrypt_orchard_memo, decrypt_sapling_memo};
-
-/// Sync batch size for block downloads.
-const BATCH_SIZE: u32 = 1000;
-
-/// In-memory cache for compact blocks during sync.
-pub struct MemoryBlockSource {
-    blocks: BTreeMap<u32, CompactBlock>,
-}
-
-impl MemoryBlockSource {
-    pub fn new() -> Self {
-        Self {
-            blocks: BTreeMap::new(),
-        }
-    }
-
-    pub fn insert(&mut self, height: u32, block: CompactBlock) {
-        self.blocks.insert(height, block);
-    }
-
-    pub fn len(&self) -> usize {
-        self.blocks.len()
-    }
-
-    pub fn clear(&mut self) {
-        self.blocks.clear();
-    }
-}
-
-impl Default for MemoryBlockSource {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BlockSource for MemoryBlockSource {
-    type Error = anyhow::Error;
-
-    fn with_blocks<F, DbErrT>(
-        &self,
-        from_height: Option<BlockHeight>,
-        limit: Option<usize>,
-        mut with_row: F,
-    ) -> std::result::Result<
-        (),
-        zcash_client_backend::data_api::chain::error::Error<DbErrT, Self::Error>,
-    >
-    where
-        F: FnMut(
-            CompactBlock,
-        ) -> std::result::Result<
-            (),
-            zcash_client_backend::data_api::chain::error::Error<DbErrT, Self::Error>,
-        >,
-    {
-        let start = from_height.map(u32::from).unwrap_or(0);
-        let mut count = 0;
-
-        for (_, block) in self.blocks.range(start..) {
-            if let Some(l) = limit {
-                if count >= l {
-                    break;
-                }
-            }
-            with_row(block.clone())?;
-            count += 1;
-        }
-
-        Ok(())
-    }
-}
 
 /// Account balance breakdown.
 #[derive(Debug, Clone)]
@@ -137,15 +61,6 @@ pub struct ReceivedMemo {
     pub memo: String,
     pub value: Zatoshis,
     pub verification: Option<VerificationData>,
-}
-
-/// Result of a sync operation.
-#[derive(Debug, Clone, Default)]
-pub struct SyncResult {
-    pub blocks_scanned: u32,
-    pub sapling_notes_received: usize,
-    pub orchard_notes_received: usize,
-    pub new_memos: Vec<ReceivedMemo>,
 }
 
 /// Transaction send result.
@@ -275,33 +190,6 @@ impl Wallet {
         Ok(response.into_inner().height as u32)
     }
 
-    /// Get the last scanned block height from the wallet.
-    pub fn get_scanned_height(&self) -> Result<Option<u32>> {
-        let meta = self
-            .db
-            .block_fully_scanned()
-            .map_err(|e| anyhow!("Failed to get scan progress: {e}"))?;
-        Ok(meta.map(|m| u32::from(m.block_height())))
-    }
-
-    /// Fetch the chain state at a specific height.
-    async fn get_chain_state_at(&mut self, height: u32) -> Result<ChainState> {
-        let tree_state = self
-            .client
-            .get_tree_state(BlockId {
-                height: height as u64,
-                hash: vec![],
-            })
-            .await
-            .map_err(|e| anyhow!("Failed to get tree state: {e}"))?
-            .into_inner();
-
-        let birthday = AccountBirthday::from_treestate(tree_state, None)
-            .map_err(|_| anyhow!("Failed to parse tree state"))?;
-
-        Ok(birthday.prior_chain_state().clone())
-    }
-
     /// Fetch birthday tree state (static method for initialization).
     async fn fetch_birthday_static(
         client: &mut CompactTxStreamerClient<Channel>,
@@ -324,154 +212,8 @@ impl Wallet {
     }
 
     // =========================================================================
-    // Synchronization Methods
-    // =========================================================================
-
-    /// Full sync from birthday to chain tip.
-    pub async fn sync(&mut self) -> Result<SyncResult> {
-        let chain_tip = self.get_chain_height().await?;
-
-        let scan_from = self
-            .get_scanned_height()?
-            .map(|h| h + 1)
-            .unwrap_or(self.birthday_height);
-
-        if scan_from > chain_tip {
-            info!("Wallet is up to date (tip: {})", chain_tip);
-            return Ok(SyncResult::default());
-        }
-
-        info!("Syncing from block {} to {}", scan_from, chain_tip);
-
-        let mut result = SyncResult::default();
-
-        let mut current = scan_from;
-        let mut block_source = MemoryBlockSource::new();
-
-        while current <= chain_tip {
-            let batch_end = std::cmp::min(current + BATCH_SIZE - 1, chain_tip);
-            info!("Downloading blocks {} to {}", current, batch_end);
-
-            // Download blocks
-            self.download_blocks(&mut block_source, current, batch_end)
-                .await?;
-
-            info!("Downloaded {} blocks, scanning...", block_source.len());
-
-            // Scan blocks
-            let from_height = BlockHeight::from_u32(current);
-            let chain_state = self.get_chain_state_at(current.saturating_sub(1)).await?;
-
-            let scan_result = scan_cached_blocks(
-                &MainNetwork,
-                &block_source,
-                &mut self.db,
-                from_height,
-                &chain_state,
-                block_source.len(),
-            )
-            .map_err(|e| anyhow!("Scan error: {e}"))?;
-
-            result.sapling_notes_received += scan_result.received_sapling_note_count();
-            result.orchard_notes_received += scan_result.received_orchard_note_count();
-            result.blocks_scanned += batch_end - current + 1;
-
-            info!(
-                "Scanned batch: {} sapling, {} orchard notes",
-                scan_result.received_sapling_note_count(),
-                scan_result.received_orchard_note_count()
-            );
-
-            block_source.clear();
-            current = batch_end + 1;
-        }
-
-        // Fetch memos for any new notes
-        result.new_memos = self.fetch_pending_memos().await?;
-
-        info!(
-            "Sync complete: {} blocks, {} sapling, {} orchard, {} memos",
-            result.blocks_scanned,
-            result.sapling_notes_received,
-            result.orchard_notes_received,
-            result.new_memos.len()
-        );
-
-        Ok(result)
-    }
-
-    /// Download blocks into the block source.
-    async fn download_blocks(
-        &mut self,
-        block_source: &mut MemoryBlockSource,
-        start: u32,
-        end: u32,
-    ) -> Result<()> {
-        let block_range = BlockRange {
-            start: Some(BlockId {
-                height: start as u64,
-                hash: vec![],
-            }),
-            end: Some(BlockId {
-                height: end as u64,
-                hash: vec![],
-            }),
-        };
-
-        let mut stream = self
-            .client
-            .get_block_range(block_range)
-            .await
-            .map_err(|e| anyhow!("Failed to get block range: {e}"))?
-            .into_inner();
-
-        use tokio_stream::StreamExt;
-        while let Some(block) = stream.next().await {
-            let block = block.map_err(|e| anyhow!("Stream error: {e}"))?;
-            block_source.insert(block.height as u32, block);
-        }
-
-        Ok(())
-    }
-
-    // =========================================================================
     // Memo Methods
     // =========================================================================
-
-    /// Fetch memos for notes that need memo enhancement.
-    ///
-    /// After scanning, notes are stored without memos (compact blocks don't include them).
-    /// This method fetches full transactions and decrypts memos for recent notes.
-    pub async fn fetch_pending_memos(&mut self) -> Result<Vec<ReceivedMemo>> {
-        // Get notes that need memo enhancement using transaction_data_requests
-        let requests = self
-            .db
-            .transaction_data_requests()
-            .map_err(|e| anyhow!("Failed to get data requests: {e}"))?;
-
-        let mut memos = Vec::new();
-
-        for request in requests {
-            match request {
-                zcash_client_backend::data_api::TransactionDataRequest::GetStatus(_) => {
-                    // Status requests are for pending transactions, skip for now
-                    continue;
-                }
-                zcash_client_backend::data_api::TransactionDataRequest::Enhancement(txid) => {
-                    // Fetch and process this transaction
-                    match self.fetch_and_process_transaction(&txid).await {
-                        Ok(Some(memo)) => memos.push(memo),
-                        Ok(None) => {}
-                        Err(e) => {
-                            warn!("Failed to process transaction {}: {}", hex::encode(txid.as_ref()), e);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(memos)
-    }
 
     /// Fetch a transaction from lightwalletd, decrypt memo, and store enhanced data.
     async fn fetch_and_process_transaction(&mut self, txid: &TxId) -> Result<Option<ReceivedMemo>> {
@@ -554,12 +296,6 @@ impl Wallet {
         // TODO: Query received notes for this txid and sum values
         // For now return ZERO, the actual value should come from the note decryption
         Ok(Zatoshis::ZERO)
-    }
-
-    /// Fetch all memos (for display purposes).
-    pub async fn get_all_memos(&mut self) -> Result<Vec<ReceivedMemo>> {
-        // First ensure we have latest memos
-        self.fetch_pending_memos().await
     }
 
     // =========================================================================
