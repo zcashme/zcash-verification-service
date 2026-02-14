@@ -38,7 +38,7 @@ use zcash_protocol::{
 
 use crate::memo_rules::{validate_memo, VerificationData};
 use crate::otp_rules::create_change_strategy;
-use crate::scan::{decrypt_orchard_memo, decrypt_sapling_memo};
+use crate::scan::decrypt_first_memo;
 
 /// Account balance breakdown.
 #[derive(Debug, Clone)]
@@ -255,47 +255,21 @@ impl Wallet {
             .set_transaction_status(*txid, zcash_client_backend::data_api::TransactionStatus::Mined(block_height))
             .map_err(|e| anyhow!("Failed to store transaction: {e}"))?;
 
-        // Try to decrypt memo
+        // Decrypt memo using unified API (handles both Sapling and Orchard)
         let ufvk = self.usk.to_unified_full_viewing_key();
 
-        // Try Sapling first
-        if let Some(memo_text) = decrypt_sapling_memo(&tx, &ufvk, block_height)? {
-            if !memo_text.is_empty() {
-                let verification = validate_memo(&memo_text);
-                let value = self.get_transaction_value(txid)?;
+        if let Some(decrypted) = decrypt_first_memo(&tx, &ufvk, block_height)? {
+            let verification = validate_memo(&decrypted.memo_text);
 
-                return Ok(Some(ReceivedMemo {
-                    txid_hex,
-                    memo: memo_text,
-                    value,
-                    verification,
-                }));
-            }
-        }
-
-        // Try Orchard
-        if let Some(memo_text) = decrypt_orchard_memo(&tx, &ufvk)? {
-            if !memo_text.is_empty() {
-                let verification = validate_memo(&memo_text);
-                let value = self.get_transaction_value(txid)?;
-
-                return Ok(Some(ReceivedMemo {
-                    txid_hex: txid_hex.clone(),
-                    memo: memo_text,
-                    value,
-                    verification,
-                }));
-            }
+            return Ok(Some(ReceivedMemo {
+                txid_hex,
+                memo: decrypted.memo_text,
+                value: decrypted.value, // Value now comes from decryption
+                verification,
+            }));
         }
 
         Ok(None)
-    }
-
-    /// Get total received value for a transaction.
-    fn get_transaction_value(&self, _txid: &TxId) -> Result<Zatoshis> {
-        // TODO: Query received notes for this txid and sum values
-        // For now return ZERO, the actual value should come from the note decryption
-        Ok(Zatoshis::ZERO)
     }
 
     // =========================================================================
