@@ -65,10 +65,6 @@ impl MemoryBlockSource {
         self.blocks.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
-    }
-
     pub fn clear(&mut self) {
         self.blocks.clear();
     }
@@ -121,17 +117,12 @@ impl BlockSource for MemoryBlockSource {
 #[derive(Debug, Clone, Default)]
 pub struct AccountBalance {
     pub total: u64,
-    pub sapling_spendable: u64,
-    pub orchard_spendable: u64,
-    pub pending_change: u64,
 }
 
 /// A received memo with metadata.
 #[derive(Debug, Clone)]
 pub struct ReceivedMemo {
-    pub txid: TxId,
     pub txid_hex: String,
-    pub height: u32,
     pub memo: String,
     pub value_zats: u64,
     pub verification: Option<VerificationData>,
@@ -141,8 +132,6 @@ pub struct ReceivedMemo {
 #[derive(Debug, Clone, Default)]
 pub struct SyncResult {
     pub blocks_scanned: u32,
-    pub start_height: u32,
-    pub end_height: u32,
     pub sapling_notes_received: usize,
     pub orchard_notes_received: usize,
     pub new_memos: Vec<ReceivedMemo>,
@@ -223,26 +212,6 @@ impl Wallet {
         })
     }
 
-    /// Get the account UUID.
-    pub fn account_id(&self) -> AccountUuid {
-        self.account_id
-    }
-
-    /// Get the unified spending key.
-    pub fn spending_key(&self) -> &UnifiedSpendingKey {
-        &self.usk
-    }
-
-    /// Get the unified full viewing key.
-    pub fn viewing_key(&self) -> zcash_keys::keys::UnifiedFullViewingKey {
-        self.usk.to_unified_full_viewing_key()
-    }
-
-    /// Get the birthday height.
-    pub fn birthday_height(&self) -> u32 {
-        self.birthday_height
-    }
-
     // =========================================================================
     // Address Methods
     // =========================================================================
@@ -289,17 +258,7 @@ impl Wallet {
 
         Ok(AccountBalance {
             total: u64::from(balance.total()),
-            sapling_spendable: u64::from(balance.sapling_balance().spendable_value()),
-            orchard_spendable: u64::from(balance.orchard_balance().spendable_value()),
-            pending_change: u64::from(balance.sapling_balance().change_pending_confirmation())
-                + u64::from(balance.orchard_balance().change_pending_confirmation()),
         })
-    }
-
-    /// Get the spendable balance (sum of sapling + orchard spendable).
-    pub fn get_spendable_balance(&self) -> Result<u64> {
-        let balance = self.get_balance()?;
-        Ok(balance.sapling_spendable + balance.orchard_spendable)
     }
 
     // =========================================================================
@@ -384,11 +343,7 @@ impl Wallet {
 
         info!("Syncing from block {} to {}", scan_from, chain_tip);
 
-        let mut result = SyncResult {
-            start_height: scan_from,
-            end_height: chain_tip,
-            ..Default::default()
-        };
+        let mut result = SyncResult::default();
 
         let mut current = scan_from;
         let mut block_source = MemoryBlockSource::new();
@@ -443,12 +398,6 @@ impl Wallet {
         );
 
         Ok(result)
-    }
-
-    /// Incremental sync - sync only new blocks since last scan.
-    pub async fn sync_incremental(&mut self) -> Result<SyncResult> {
-        // Same as sync() - it already handles incremental
-        self.sync().await
     }
 
     /// Download blocks into the block source.
@@ -574,9 +523,7 @@ impl Wallet {
                 let value_zats = self.get_transaction_value(txid)?;
 
                 return Ok(Some(ReceivedMemo {
-                    txid: *txid,
                     txid_hex,
-                    height,
                     memo: memo_text,
                     value_zats,
                     verification,
@@ -591,9 +538,7 @@ impl Wallet {
                 let value_zats = self.get_transaction_value(txid)?;
 
                 return Ok(Some(ReceivedMemo {
-                    txid: *txid,
-                    txid_hex,
-                    height,
+                    txid_hex: txid_hex.clone(),
                     memo: memo_text,
                     value_zats,
                     verification,
@@ -726,24 +671,5 @@ impl Wallet {
         let result = self.create_transaction(request).await?;
         self.broadcast_transaction(result.raw_tx).await?;
         Ok(result.txid)
-    }
-
-    // =========================================================================
-    // Low-Level Access
-    // =========================================================================
-
-    /// Get mutable access to the wallet database.
-    pub fn db_mut(&mut self) -> &mut WalletDbType {
-        &mut self.db
-    }
-
-    /// Get immutable access to the wallet database.
-    pub fn db(&self) -> &WalletDbType {
-        &self.db
-    }
-
-    /// Get mutable access to the lightwalletd client.
-    pub fn client_mut(&mut self) -> &mut CompactTxStreamerClient<Channel> {
-        &mut self.client
     }
 }

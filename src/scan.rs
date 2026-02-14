@@ -1,64 +1,13 @@
 //! Memo decryption utilities for ZVS.
 //!
 //! This module handles decrypting memos from full Zcash transactions.
-//! Compact blocks (used for efficient sync) don't include memos - we must
-//! fetch the full transaction to read memo fields.
 
-use anyhow::{anyhow, Result};
-use tonic::transport::Channel;
+use anyhow::Result;
 use tracing::debug;
 
-use zcash_client_backend::proto::service::{
-    compact_tx_streamer_client::CompactTxStreamerClient, TxFilter,
-};
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::Transaction;
-use zcash_protocol::consensus::{BlockHeight, MainNetwork};
-
-/// Fetch a transaction from lightwalletd and decrypt its memo.
-///
-/// Returns the decrypted memo text if found, or None if no memo/empty memo.
-pub async fn fetch_and_decrypt_memo(
-    client: &mut CompactTxStreamerClient<Channel>,
-    ufvk: &UnifiedFullViewingKey,
-    txid: &[u8],
-    height: u32,
-) -> Result<Option<String>> {
-    // Fetch full transaction from lightwalletd
-    let tx_filter = TxFilter {
-        block: None,
-        index: 0,
-        hash: txid.to_vec(),
-    };
-
-    let raw_tx = client
-        .get_transaction(tx_filter)
-        .await
-        .map_err(|e| anyhow!("Failed to fetch transaction: {e}"))?
-        .into_inner();
-
-    if raw_tx.data.is_empty() {
-        return Err(anyhow!("Empty transaction data"));
-    }
-
-    // Parse transaction
-    let block_height = BlockHeight::from_u32(height);
-    let branch_id = zcash_primitives::consensus::BranchId::for_height(&MainNetwork, block_height);
-
-    let tx = Transaction::read(&raw_tx.data[..], branch_id)
-        .map_err(|e| anyhow!("Failed to parse transaction: {e}"))?;
-
-    // Try Sapling first, then Orchard
-    if let Some(memo) = decrypt_sapling_memo(&tx, ufvk, block_height)? {
-        return Ok(Some(memo));
-    }
-
-    if let Some(memo) = decrypt_orchard_memo(&tx, ufvk)? {
-        return Ok(Some(memo));
-    }
-
-    Ok(None)
-}
+use zcash_protocol::consensus::BlockHeight;
 
 /// Decrypt memo from Sapling outputs in a transaction.
 pub fn decrypt_sapling_memo(

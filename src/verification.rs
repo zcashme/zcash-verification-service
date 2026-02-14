@@ -40,27 +40,8 @@ impl VerificationService {
         Ok(Self { wallet, otp_secret })
     }
 
-    /// Get the underlying wallet.
-    pub fn wallet(&self) -> &Wallet {
-        &self.wallet
-    }
-
-    /// Get mutable access to the wallet.
-    pub fn wallet_mut(&mut self) -> &mut Wallet {
-        &mut self.wallet
-    }
-
-    // =========================================================================
-    // Wallet Delegates
-    // =========================================================================
-
     pub async fn get_latest_height(&mut self) -> Result<u32> {
         self.wallet.get_chain_height().await
-    }
-
-    pub async fn sync(&mut self) -> Result<()> {
-        self.wallet.sync().await?;
-        Ok(())
     }
 
     pub async fn sync_incremental(&mut self) -> Result<SyncResult> {
@@ -69,14 +50,6 @@ impl VerificationService {
 
     pub fn get_balance(&self) -> Result<crate::wallet::AccountBalance> {
         self.wallet.get_balance()
-    }
-
-    pub fn get_sapling_address(&self) -> Result<String> {
-        self.wallet.get_sapling_address()
-    }
-
-    pub fn get_unified_address(&self) -> Result<String> {
-        self.wallet.get_unified_address()
     }
 
     pub fn get_address(&self) -> Result<String> {
