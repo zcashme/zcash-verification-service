@@ -19,14 +19,17 @@ use tonic::transport::Channel;
 use zcash_client_backend::{
     data_api::{
         wallet::{
-            create_proposed_transactions, input_selection::GreedyInputSelector,
-            propose_transfer, ConfirmationsPolicy, SpendingKeys,
+            create_proposed_transactions, decrypt_and_store_transaction,
+            input_selection::GreedyInputSelector, propose_transfer, ConfirmationsPolicy,
+            SpendingKeys,
         },
-        AccountBirthday, WalletRead, WalletWrite,
+        AccountBirthday, TransactionDataRequest, WalletRead, WalletWrite,
     },
     decrypt_transaction,
     fees::{zip317::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule},
-    proto::service::{compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction},
+    proto::service::{
+        compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction, TxFilter,
+    },
     wallet::OvkPolicy,
     zip321::TransactionRequest,
     TransferType,
@@ -39,7 +42,7 @@ use zcash_client_sqlite::{
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_protocol::{
-    consensus::{BlockHeight, MainNetwork},
+    consensus::{BlockHeight, BranchId, MainNetwork},
     memo::MemoBytes,
     value::Zatoshis,
     ShieldedProtocol,
@@ -156,6 +159,7 @@ impl Wallet {
     ///
     /// Downloads compact blocks and scans for relevant transactions.
     /// Uses in-memory block cache (re-downloads on each run).
+    /// After scanning, fetches full transactions to decrypt memos.
     pub async fn sync(
         &mut self,
         client: &mut zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient<tonic::transport::Channel>,
@@ -174,7 +178,64 @@ impl Wallet {
         .await
         .map_err(|e| anyhow!("Sync failed: {:?}", e))?;
 
-        info!("Wallet sync complete");
+        info!("Wallet sync complete, processing enhancement requests...");
+
+        // Process transaction enhancement requests to fetch full transactions and decrypt memos
+        let requests = self
+            .db
+            .transaction_data_requests()
+            .map_err(|e| anyhow!("Failed to get transaction data requests: {:?}", e))?;
+
+        let mut enhanced_count = 0;
+        for request in requests {
+            if let TransactionDataRequest::Enhancement(txid) = request {
+                debug!("Enhancing transaction: {}", hex::encode(txid.as_ref()));
+
+                // Fetch full transaction from lightwalletd
+                let response = client
+                    .get_transaction(TxFilter {
+                        block: None,
+                        index: 0,
+                        hash: txid.as_ref().to_vec(),
+                    })
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "Failed to fetch transaction {}: {:?}",
+                            hex::encode(txid.as_ref()),
+                            e
+                        )
+                    })?;
+
+                let raw_tx = response.into_inner();
+
+                // Get the mined height for this transaction
+                let mined_height = self
+                    .db
+                    .get_tx_height(txid)
+                    .map_err(|e| anyhow!("Failed to get tx height: {:?}", e))?;
+
+                // Determine the branch ID for parsing
+                let branch_id = mined_height
+                    .map(|h| BranchId::for_height(&MainNetwork, h))
+                    .unwrap_or(BranchId::Nu5);
+
+                // Parse the transaction
+                let tx = Transaction::read(&raw_tx.data[..], branch_id)
+                    .map_err(|e| anyhow!("Failed to parse transaction: {:?}", e))?;
+
+                // Decrypt and store the transaction (this updates memos in the DB)
+                decrypt_and_store_transaction(&MainNetwork, &mut self.db, &tx, mined_height)
+                    .map_err(|e| anyhow!("Failed to decrypt and store transaction: {:?}", e))?;
+
+                enhanced_count += 1;
+            }
+        }
+
+        if enhanced_count > 0 {
+            info!("Enhanced {} transactions with full memo data", enhanced_count);
+        }
+
         Ok(())
     }
 
