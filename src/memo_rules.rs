@@ -1,6 +1,9 @@
 //! Memo validation for ZVS verification requests.
 
-use zcash_protocol::value::Zatoshis;
+use zcash_protocol::{
+    memo::{Memo, MemoBytes},
+    value::Zatoshis,
+};
 
 /// Minimum payment required for a verification request.
 pub const MIN_PAYMENT: Zatoshis = Zatoshis::const_from_u64(2_000);
@@ -30,4 +33,19 @@ pub fn validate_memo(memo: &str) -> Option<VerificationData> {
         });
     }
     None
+}
+
+/// Extract UTF-8 text from MemoBytes.
+///
+/// Per ZIP-302:
+/// - Empty memos return empty string
+/// - Text memos are extracted as UTF-8
+pub fn extract_memo_text(memo_bytes: &MemoBytes) -> String {
+    match Memo::try_from(memo_bytes.clone()) {
+        Ok(Memo::Text(text)) => text.to_string(),
+        Ok(Memo::Empty) => String::new(),
+        Ok(Memo::Future(_)) => String::new(),
+        Ok(Memo::Arbitrary(_)) => String::new(),
+        Err(_) => String::new(),
+    }
 }

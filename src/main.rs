@@ -113,9 +113,10 @@ async fn run_mempool_service(
             // Decrypt memo using wallet
             if let Some(decrypted) = wallet.decrypt_memo(&tx, height) {
                 let txid_hex = hex::encode(decrypted.txid.as_ref());
+                let memo_text = memo_rules::extract_memo_text(&decrypted.memo);
 
                 // Validate memo format
-                if let Some(verification) = memo_rules::validate_memo(&decrypted.memo_text) {
+                if let Some(verification) = memo_rules::validate_memo(&memo_text) {
                     // Check payment amount
                     if memo_rules::is_valid_payment(decrypted.value) {
                         // Generate OTP

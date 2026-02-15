@@ -38,7 +38,7 @@ use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_protocol::{
     consensus::{BlockHeight, MainNetwork},
-    memo::{Memo, MemoBytes},
+    memo::MemoBytes,
     value::Zatoshis,
 };
 
@@ -64,7 +64,7 @@ impl Default for AccountBalance {
 #[derive(Debug, Clone)]
 pub struct DecryptedMemo {
     pub txid: TxId,
-    pub memo_text: String,
+    pub memo: MemoBytes,
     pub value: Zatoshis,
 }
 
@@ -321,15 +321,12 @@ impl Wallet {
                 continue;
             }
 
-            let memo_text = extract_memo_text(output.memo());
-            if !memo_text.is_empty() {
-                debug!("Decrypted Sapling memo: {}", memo_text);
-                return Some(DecryptedMemo {
-                    txid: tx.txid(),
-                    memo_text,
-                    value: output.note_value(),
-                });
-            }
+            debug!("Decrypted Sapling memo");
+            return Some(DecryptedMemo {
+                txid: tx.txid(),
+                memo: output.memo().clone(),
+                value: output.note_value(),
+            });
         }
 
         // Process Orchard outputs
@@ -338,36 +335,14 @@ impl Wallet {
                 continue;
             }
 
-            let memo_text = extract_memo_text(output.memo());
-            if !memo_text.is_empty() {
-                debug!("Decrypted Orchard memo: {}", memo_text);
-                return Some(DecryptedMemo {
-                    txid: tx.txid(),
-                    memo_text,
-                    value: output.note_value(),
-                });
-            }
+            debug!("Decrypted Orchard memo");
+            return Some(DecryptedMemo {
+                txid: tx.txid(),
+                memo: output.memo().clone(),
+                value: output.note_value(),
+            });
         }
 
         None
-    }
-}
-
-// =============================================================================
-// Helper Functions
-// =============================================================================
-
-/// Extract UTF-8 text from MemoBytes.
-///
-/// Per ZIP-302:
-/// - Empty memos return empty string
-/// - Text memos are extracted as UTF-8
-fn extract_memo_text(memo_bytes: &MemoBytes) -> String {
-    match Memo::try_from(memo_bytes.clone()) {
-        Ok(Memo::Text(text)) => text.to_string(),
-        Ok(Memo::Empty) => String::new(),
-        Ok(Memo::Future(_)) => String::new(),
-        Ok(Memo::Arbitrary(_)) => String::new(),
-        Err(_) => String::new(),
     }
 }

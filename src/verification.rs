@@ -5,7 +5,7 @@
 
 use tracing::{error, info, warn};
 
-use crate::memo_rules::{is_valid_payment, validate_memo, MIN_PAYMENT};
+use crate::memo_rules::{extract_memo_text, is_valid_payment, validate_memo, MIN_PAYMENT};
 use crate::otp_rules::{create_otp_transaction_request, generate_otp, OtpResponseParams};
 use crate::wallet::{DecryptedMemo, Wallet};
 
@@ -21,14 +21,15 @@ pub async fn handle_memo(
     otp_secret: &[u8],
 ) -> anyhow::Result<()> {
     let txid_hex = hex::encode(memo.txid.as_ref());
+    let memo_text = extract_memo_text(&memo.memo);
 
     // Check if this is a verification request
-    let Some(verification) = validate_memo(&memo.memo_text) else {
+    let Some(verification) = validate_memo(&memo_text) else {
         // Not a verification request - just log if it has content
-        if !memo.memo_text.is_empty() {
+        if !memo_text.is_empty() {
             info!(
                 "Memo received (not a verification request): \"{}\" (value={} zats, tx={})",
-                memo.memo_text.chars().take(50).collect::<String>(),
+                memo_text.chars().take(50).collect::<String>(),
                 u64::from(memo.value),
                 txid_hex
             );
