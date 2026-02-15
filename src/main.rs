@@ -130,11 +130,26 @@ async fn run_mempool_service(
                         info!("Generated OTP: {}", otp);
                         info!("Response memo: {}", response_memo);
                         info!("Reply to: {}", verification.user_address);
-                        info!("[DRY RUN] Would send {} zats to {}",
-                            u64::from(memo_rules::RESPONSE_AMOUNT),
-                            verification.user_address
-                        );
                         info!("============================");
+
+                        // TODO: Send OTP response transaction
+                        // let request = otp_rules::create_otp_transaction_request(
+                        //     &otp_rules::OtpResponseParams {
+                        //         recipient_address: verification.user_address.clone(),
+                        //         otp_code: otp.clone(),
+                        //         request_txid_hex: txid_hex.clone(),
+                        //     },
+                        // )?;
+                        //
+                        // match wallet.send_transaction(&mut client, request).await {
+                        //     Ok(response_txid) => {
+                        //         info!("OTP sent! Response tx: {}", hex::encode(response_txid.as_ref()));
+                        //     }
+                        //     Err(e) => {
+                        //         error!("Failed to send OTP: {}", e);
+                        //         // TODO: Add to retry queue
+                        //     }
+                        // }
                     } else {
                         warn!(
                             "Payment too low: {} zats < {} minimum (tx={})",
