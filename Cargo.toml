@@ -18,7 +18,7 @@ prost = "0.14"
 zcash_client_backend = { version = "0.21", features = ["lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots", "lightwalletd-tonic-transport", "orchard", "sync"] }
 zcash_client_sqlite = { version = "0.19", features = ["orchard"] }
 zcash_protocol = "0.7"
-zcash_proofs = { version = "0.26", features = ["local-prover"] }
+zcash_proofs = { version = "0.26", features = ["bundled-prover"] }
 zcash_keys = { version = "0.12", features = ["orchard", "sapling"] }
 zcash_primitives = "0.26"
 zcash_note_encryption = "0.4"

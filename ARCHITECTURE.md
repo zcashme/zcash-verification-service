@@ -33,10 +33,8 @@ ZVS (Zcash Verification Service) is a real-time OTP verification service built o
 │  1. Decrypt memo (wallet viewing key)                            │
 │  2. Validate memo (memo_rules.rs)                                │
 │  3. Check payment ≥ MIN_PAYMENT (2000 zats)                     │
-│  4. Check dedup (SQLite: already responded?)                     │
-│  5. Generate OTP: HMAC(secret, session_id) → 6 digits           │
-│  6. Send response tx (RESPONSE_AMOUNT + OTP memo)               │
-│  7. Record response (SQLite)                                     │
+│  4. Generate OTP: HMAC(secret, session_id) → 6 digits           │
+│  5. Send response tx (RESPONSE_AMOUNT + OTP memo)               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

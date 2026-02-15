@@ -14,11 +14,26 @@ use anyhow::{anyhow, Result};
 use secrecy::Secret;
 use tracing::{debug, info};
 
+use tonic::transport::Channel;
 use zcash_client_backend::{
-    data_api::{wallet::ConfirmationsPolicy, AccountBirthday, WalletRead, WalletWrite},
-    decrypt_transaction, TransferType,
+    data_api::{
+        wallet::{
+            create_proposed_transactions, input_selection::GreedyInputSelector,
+            propose_transfer, ConfirmationsPolicy, SpendingKeys,
+        },
+        AccountBirthday, WalletRead, WalletWrite,
+    },
+    decrypt_transaction,
+    proto::service::{compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction},
+    wallet::OvkPolicy,
+    zip321::TransactionRequest,
+    TransferType,
 };
-use zcash_client_sqlite::{util::SystemClock, wallet::init::init_wallet_db, AccountUuid, WalletDb};
+use zcash_proofs::prover::LocalTxProver;
+use zcash_client_sqlite::{
+    util::SystemClock, wallet::commitment_tree, wallet::init::init_wallet_db, AccountUuid,
+    ReceivedNoteId, WalletDb,
+};
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_protocol::{
@@ -55,6 +70,16 @@ pub struct DecryptedMemo {
 
 /// The wallet database type used throughout ZVS.
 pub type WalletDbType = WalletDb<rusqlite::Connection, MainNetwork, SystemClock, rand::rngs::OsRng>;
+
+/// Error type alias for propose/create functions.
+type WalletError = zcash_client_backend::data_api::error::Error<
+    zcash_client_sqlite::error::SqliteClientError,
+    commitment_tree::Error,
+    zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError,
+    zcash_primitives::transaction::fees::zip317::FeeError,
+    zcash_primitives::transaction::fees::zip317::FeeError,
+    ReceivedNoteId,
+>;
 
 // =============================================================================
 // Wallet
@@ -148,6 +173,84 @@ impl Wallet {
 
         info!("Wallet sync complete");
         Ok(())
+    }
+
+    // =========================================================================
+    // Transaction Sending
+    // =========================================================================
+
+    /// Send a transaction.
+    ///
+    /// Takes a ZIP-321 transaction request, builds the transaction, and broadcasts it.
+    pub async fn send_transaction(
+        &mut self,
+        client: &mut CompactTxStreamerClient<Channel>,
+        request: TransactionRequest,
+    ) -> Result<TxId> {
+        let input_selector = GreedyInputSelector::new();
+        let change_strategy = crate::otp_rules::create_change_strategy();
+
+        // Step 1: Propose transfer (select inputs)
+        info!("Proposing transfer...");
+        let result: Result<_, WalletError> = propose_transfer(
+            &mut self.db,
+            &MainNetwork,
+            self.account_id,
+            &input_selector,
+            &change_strategy,
+            request,
+            ConfirmationsPolicy::default(),
+        );
+        let proposal = result.map_err(|e| anyhow!("Propose failed: {:?}", e))?;
+
+        // Step 2: Create and sign transaction
+        info!("Creating transaction...");
+        let prover = LocalTxProver::bundled();
+        let result: Result<_, WalletError> = create_proposed_transactions(
+            &mut self.db,
+            &MainNetwork,
+            &prover,
+            &prover,
+            &SpendingKeys::from_unified_spending_key(self.usk.clone()),
+            OvkPolicy::Sender,
+            &proposal,
+        );
+        let txids = result.map_err(|e| anyhow!("Create tx failed: {:?}", e))?;
+
+        let txid = *txids.first();
+
+        // Step 3: Get raw transaction from DB
+        let tx_data = self
+            .db
+            .get_transaction(txid)
+            .map_err(|e| anyhow!("Failed to get tx: {:?}", e))?
+            .ok_or_else(|| anyhow!("Transaction not found after creation"))?;
+
+        let mut raw_tx_bytes = Vec::new();
+        tx_data
+            .write(&mut raw_tx_bytes)
+            .map_err(|e| anyhow!("Failed to serialize tx: {:?}", e))?;
+
+        // Step 4: Broadcast
+        info!("Broadcasting transaction...");
+        let response = client
+            .send_transaction(RawTransaction {
+                data: raw_tx_bytes,
+                height: 0,
+            })
+            .await
+            .map_err(|e| anyhow!("Broadcast failed: {:?}", e))?;
+
+        let send_response = response.into_inner();
+        if send_response.error_code != 0 {
+            return Err(anyhow!(
+                "Broadcast rejected: {}",
+                send_response.error_message
+            ));
+        }
+
+        info!("Transaction sent: {}", hex::encode(txid.as_ref()));
+        Ok(txid)
     }
 
     // =========================================================================
