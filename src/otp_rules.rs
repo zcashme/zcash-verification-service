@@ -15,10 +15,7 @@ use crate::memo_rules::RESPONSE_AMOUNT;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// OTP response memo format: `ZVS:otp:XXXXXX:req:TXID_PREFIX`
-/// - XXXXXX: 6-digit OTP code
-/// - TXID_PREFIX: First 16 chars of request txid for correlation
-const TXID_PREFIX_LEN: usize = 16;
+/// OTP response memo format: just the 6-digit code.
 
 /// Generate HMAC-based OTP from session ID and secret.
 pub fn generate_otp(secret: &[u8], session_id: &str) -> String {
@@ -31,12 +28,9 @@ pub fn generate_otp(secret: &[u8], session_id: &str) -> String {
     format!("{:06}", code % 1_000_000)
 }
 
-/// Build the OTP response memo string.
-///
-/// Format: `ZVS:otp:XXXXXX:req:TXID_PREFIX`
-pub fn build_otp_memo(otp: &str, request_txid_hex: &str) -> String {
-    let txid_prefix = &request_txid_hex[..std::cmp::min(TXID_PREFIX_LEN, request_txid_hex.len())];
-    format!("ZVS:otp:{}:req:{}", otp, txid_prefix)
+/// Build the OTP response memo string (just the 6-digit code).
+pub fn build_otp_memo(otp: &str) -> String {
+    otp.to_string()
 }
 
 /// Parameters for creating an OTP response transaction.
@@ -49,7 +43,7 @@ pub struct OtpResponseParams {
 
 /// Create a ZIP-321 transaction request for the OTP response.
 pub fn create_otp_transaction_request(params: &OtpResponseParams) -> Result<TransactionRequest> {
-    let memo_text = build_otp_memo(&params.otp_code, &params.request_txid_hex);
+    let memo_text = build_otp_memo(&params.otp_code);
 
     info!("=== OTP RESPONSE ===");
     info!("To: {}", params.recipient_address);
@@ -111,20 +105,7 @@ mod tests {
     #[test]
     fn test_build_otp_memo() {
         let otp = "123456";
-        let txid = "abcdef1234567890abcdef1234567890";
-
-        let memo = build_otp_memo(otp, txid);
-
-        assert_eq!(memo, "ZVS:otp:123456:req:abcdef1234567890");
-    }
-
-    #[test]
-    fn test_build_otp_memo_short_txid() {
-        let otp = "654321";
-        let txid = "abc123";
-
-        let memo = build_otp_memo(otp, txid);
-
-        assert_eq!(memo, "ZVS:otp:654321:req:abc123");
+        let memo = build_otp_memo(otp);
+        assert_eq!(memo, "123456");
     }
 }

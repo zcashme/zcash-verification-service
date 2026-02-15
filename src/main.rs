@@ -121,7 +121,7 @@ async fn run_mempool_service(
                     if memo_rules::is_valid_payment(decrypted.value) {
                         // Generate OTP
                         let otp = otp_rules::generate_otp(otp_secret, &verification.session_id);
-                        let response_memo = otp_rules::build_otp_memo(&otp, &txid_hex);
+                        let response_memo = otp_rules::build_otp_memo(&otp);
 
                         info!("=== VERIFICATION REQUEST ===");
                         info!("Session: {}", verification.session_id);
