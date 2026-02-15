@@ -24,6 +24,13 @@ mod wallet;
 use wallet::Wallet;
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// Number of blocks between background syncs (matches confirmation policy)
+const SYNC_BLOCK_INTERVAL: u32 = 1;
+
+// =============================================================================
 // Types
 // =============================================================================
 
@@ -93,17 +100,34 @@ async fn main() -> Result<()> {
     println!();
 
     // Initial sync
-    println!("Syncing wallet...");
+    println!("=== INITIAL SYNC ===");
+    println!("Syncing wallet to chain tip...");
     wallet.sync(&mut client).await?;
+
+    let synced_height = wallet.get_synced_height().unwrap_or(0);
+    println!("Synced to block: {}", synced_height);
 
     match wallet.get_balance() {
         Ok(balance) => {
             let total_zats = u64::from(balance.total);
-            let total_zec = total_zats as f64 / 100_000_000.0;
-            println!("Balance: {:.8} ZEC ({} zats)", total_zec, total_zats);
+            let spendable_zats = u64::from(balance.spendable);
+            let sapling_zats = u64::from(balance.sapling_spendable);
+            let orchard_zats = u64::from(balance.orchard_spendable);
+            let spendable_zec = spendable_zats as f64 / 100_000_000.0;
+            println!(
+                "Balance: {:.8} ZEC ({} spendable, {} total)",
+                spendable_zec, spendable_zats, total_zats
+            );
+            println!(
+                "  Pools: Sapling={} zats, Orchard={} zats",
+                sapling_zats, orchard_zats
+            );
         }
         Err(e) => println!("Balance error: {}", e),
     }
+    println!("====================");
+    println!();
+    println!("Background sync: every {} blocks", SYNC_BLOCK_INTERVAL);
     println!();
 
     // Extract UFVK for mempool monitoring (doesn't need wallet ownership)
@@ -124,9 +148,8 @@ async fn main() -> Result<()> {
 
     // Spawn response sender task (owns wallet)
     let sender_url = url.clone();
-    let sender_handle = tokio::spawn(async move {
-        run_response_sender(&sender_url, wallet, request_rx).await
-    });
+    let sender_handle =
+        tokio::spawn(async move { run_response_sender(&sender_url, wallet, request_rx).await });
 
     tokio::select! {
         result = monitor_handle => {
@@ -243,13 +266,17 @@ async fn run_mempool_monitor(
 
 /// Send OTP responses to verification requests.
 ///
-/// This task owns the wallet and handles syncing before sending.
+/// This task owns the wallet. Syncing happens when 10+ new blocks are mined,
+/// not per-request, so sends are instant.
 async fn run_response_sender(
     url: &str,
     mut wallet: Wallet,
     mut request_rx: mpsc::Receiver<VerificationRequest>,
 ) -> Result<()> {
-    info!("Starting response sender");
+    info!(
+        "Starting response sender (sync every {} blocks)",
+        SYNC_BLOCK_INTERVAL
+    );
 
     // Create dedicated connection for sending
     let mut client = CompactTxStreamerClient::connect(url.to_string()).await?;
@@ -258,54 +285,100 @@ async fn run_response_sender(
     let otp_secret_hex = env::var("OTP_SECRET").expect("OTP_SECRET required");
     let otp_secret = hex::decode(&otp_secret_hex)?;
 
-    while let Some(request) = request_rx.recv().await {
-        let txid_hex = hex::encode(request.request_txid.as_ref());
-        info!(
-            "Processing verification request: {} ({} zats)",
-            txid_hex,
-            u64::from(request.value)
-        );
+    // Track last synced height
+    let mut last_synced_height: u32 = wallet.get_synced_height().unwrap_or(0);
 
-        // Sync wallet before sending to ensure we have spendable notes
-        if let Err(e) = wallet.sync(&mut client).await {
-            error!("Sync failed before sending response: {}", e);
-            // Continue to next request - don't block the queue
-            continue;
-        }
+    // Check for new blocks every 30 seconds
+    let mut block_check_interval = tokio::time::interval(Duration::from_secs(30));
+    block_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Generate OTP
-        let otp = otp_rules::generate_otp(&otp_secret, &request.session_id);
-
-        // Create transaction request
-        let params = otp_rules::OtpResponseParams {
-            recipient_address: request.user_address.clone(),
-            otp_code: otp.clone(),
-            request_txid_hex: txid_hex.clone(),
-        };
-
-        let tx_request = match otp_rules::create_otp_transaction_request(&params) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Failed to create transaction request: {}", e);
-                continue;
+    loop {
+        tokio::select! {
+            // Check chain tip and sync if 10+ new blocks
+            _ = block_check_interval.tick() => {
+                match get_chain_height(&mut client).await {
+                    Ok(chain_height) if chain_height >= last_synced_height + SYNC_BLOCK_INTERVAL => {
+                        info!(
+                            "Chain at {}, last sync at {} (+{} blocks). Syncing...",
+                            chain_height, last_synced_height, chain_height - last_synced_height
+                        );
+                        if let Err(e) = wallet.sync(&mut client).await {
+                            error!("Background sync failed: {}", e);
+                        } else {
+                            last_synced_height = chain_height;
+                            match wallet.get_balance() {
+                                Ok(b) => info!(
+                                    "Sync complete @ {}. Balance: {} spendable (S={}, O={})",
+                                    chain_height,
+                                    u64::from(b.spendable),
+                                    u64::from(b.sapling_spendable),
+                                    u64::from(b.orchard_spendable)
+                                ),
+                                Err(_) => info!("Sync complete @ {}", chain_height),
+                            }
+                        }
+                    }
+                    Ok(_) => {} // Not enough new blocks yet
+                    Err(e) => {
+                        warn!("Failed to get chain height: {}", e);
+                    }
+                }
             }
-        };
 
-        // Send the response transaction
-        match wallet.send_transaction(&mut client, tx_request).await {
-            Ok(response_txid) => {
+            // Process verification requests instantly
+            request = request_rx.recv() => {
+                let Some(request) = request else { break };
+
+                let txid_hex = hex::encode(request.request_txid.as_ref());
                 info!(
-                    "OTP response sent! tx={} (reply to {})",
-                    hex::encode(response_txid.as_ref()),
-                    txid_hex
+                    "Processing verification request: {} ({} zats)",
+                    txid_hex,
+                    u64::from(request.value)
                 );
-            }
-            Err(e) => {
-                error!("Failed to send OTP response: {}", e);
-                // TODO: Add to retry queue
+
+                // Generate OTP
+                let otp = otp_rules::generate_otp(&otp_secret, &request.session_id);
+
+                // Create transaction request
+                let params = otp_rules::OtpResponseParams {
+                    recipient_address: request.user_address.clone(),
+                    otp_code: otp.clone(),
+                    request_txid_hex: txid_hex.clone(),
+                };
+
+                let tx_request = match otp_rules::create_otp_transaction_request(&params) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("Failed to create transaction request: {}", e);
+                        continue;
+                    }
+                };
+
+                // Send the response transaction (no sync - use current state)
+                match wallet.send_transaction(&mut client, tx_request).await {
+                    Ok(response_txid) => {
+                        info!(
+                            "OTP response sent! tx={} (reply to {})",
+                            hex::encode(response_txid.as_ref()),
+                            txid_hex
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to send OTP response: {}", e);
+                    }
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Get current chain height from lightwalletd
+async fn get_chain_height(
+    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+) -> Result<u32> {
+    use zcash_client_backend::proto::service::ChainSpec;
+    let response = client.get_latest_block(ChainSpec {}).await?;
+    Ok(response.into_inner().height as u32)
 }

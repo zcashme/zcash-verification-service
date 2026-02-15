@@ -56,12 +56,18 @@ use zcash_protocol::{
 #[derive(Debug, Clone)]
 pub struct AccountBalance {
     pub total: Zatoshis,
+    pub spendable: Zatoshis,
+    pub sapling_spendable: Zatoshis,
+    pub orchard_spendable: Zatoshis,
 }
 
 impl Default for AccountBalance {
     fn default() -> Self {
         Self {
             total: Zatoshis::ZERO,
+            spendable: Zatoshis::ZERO,
+            sapling_spendable: Zatoshis::ZERO,
+            orchard_spendable: Zatoshis::ZERO,
         }
     }
 }
@@ -336,6 +342,15 @@ impl Wallet {
     // Balance Methods
     // =========================================================================
 
+    /// Get the last synced block height.
+    pub fn get_synced_height(&self) -> Option<u32> {
+        self.db
+            .chain_height()
+            .ok()
+            .flatten()
+            .map(|h| u32::from(h))
+    }
+
     /// Get the account balance.
     pub fn get_balance(&self) -> Result<AccountBalance> {
         let summary = self
@@ -351,6 +366,9 @@ impl Wallet {
 
         Ok(AccountBalance {
             total: balance.total(),
+            spendable: balance.spendable_value(),
+            sapling_spendable: balance.sapling_balance().spendable_value(),
+            orchard_spendable: balance.orchard_balance().spendable_value(),
         })
     }
 

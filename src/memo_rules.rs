@@ -14,7 +14,7 @@ use zcash_protocol::{
 pub const MIN_PAYMENT: Zatoshis = Zatoshis::const_from_u64(2_000);
 
 /// Amount sent back with OTP response.
-pub const RESPONSE_AMOUNT: Zatoshis = Zatoshis::const_from_u64(1_000);
+pub const RESPONSE_AMOUNT: Zatoshis = Zatoshis::const_from_u64(10_000);
 
 /// Prefix identifying a ZVS verification request.
 const ZVS_PREFIX: &str = "zvs/";
