@@ -15,8 +15,6 @@ use crate::memo_rules::RESPONSE_AMOUNT;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// OTP response memo format: just the 6-digit code.
-
 /// Generate HMAC-based OTP from session ID and secret.
 pub fn generate_otp(secret: &[u8], session_id: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(secret)
@@ -63,7 +61,7 @@ pub fn create_otp_transaction_request(params: &OtpResponseParams) -> Result<Tran
     let amount = RESPONSE_AMOUNT;
 
     let payment = Payment::new(
-        recipient.into(),
+        recipient,
         amount,
         Some(memo),
         None, // label

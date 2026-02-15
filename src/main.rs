@@ -1,14 +1,19 @@
 //! ZVS - Zcash Verification Service
 //!
-//! Streams mempool transactions and logs verification requests in real-time.
+//! Streams mempool transactions and responds to verification requests in real-time.
 
 use std::env;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
+use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_primitives::transaction::TxId;
+use zcash_protocol::value::Zatoshis;
 
 mod memo_rules;
 mod otp_rules;
@@ -17,6 +22,27 @@ mod sync;
 mod wallet;
 
 use wallet::Wallet;
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/// A verified request ready to be processed by the response sender.
+#[derive(Debug, Clone)]
+struct VerificationRequest {
+    /// Session ID from the memo.
+    session_id: String,
+    /// User's address to send the OTP response to.
+    user_address: String,
+    /// Transaction ID of the request.
+    request_txid: TxId,
+    /// Payment value in zatoshis.
+    value: Zatoshis,
+}
+
+// =============================================================================
+// Main
+// =============================================================================
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,7 +83,7 @@ async fn main() -> Result<()> {
     // Fetch birthday for wallet initialization (only needed if wallet.db doesn't exist)
     let birthday = sync::fetch_birthday(&mut client, birthday_height).await?;
 
-    // Create wallet
+    // Create wallet and do initial sync
     let mut wallet = Wallet::new(&seed, Some(&birthday), &data_dir)?;
 
     match wallet.get_address() {
@@ -66,7 +92,7 @@ async fn main() -> Result<()> {
     }
     println!();
 
-    // Sync wallet
+    // Initial sync
     println!("Syncing wallet...");
     wallet.sync(&mut client).await?;
 
@@ -80,14 +106,37 @@ async fn main() -> Result<()> {
     }
     println!();
 
+    // Extract UFVK for mempool monitoring (doesn't need wallet ownership)
+    let ufvk = wallet.get_ufvk();
+
+    // Channel for passing verification requests from monitor to sender
+    let (request_tx, request_rx) = mpsc::channel::<VerificationRequest>(32);
+
     println!("Starting ZVS mempool service...");
     println!("Press Ctrl+C to stop");
     println!();
 
+    // Spawn mempool monitor task (uses UFVK only, no wallet ownership)
+    let monitor_url = url.clone();
+    let monitor_handle = tokio::spawn(async move {
+        run_mempool_monitor(&monitor_url, &ufvk, &otp_secret_bytes, request_tx).await
+    });
+
+    // Spawn response sender task (owns wallet)
+    let sender_url = url.clone();
+    let sender_handle = tokio::spawn(async move {
+        run_response_sender(&sender_url, wallet, request_rx).await
+    });
+
     tokio::select! {
-        result = run_mempool_service(&mut client, &wallet, &otp_secret_bytes) => {
+        result = monitor_handle => {
             if let Err(e) = result {
-                eprintln!("Service error: {}", e);
+                error!("Mempool monitor task failed: {}", e);
+            }
+        }
+        result = sender_handle => {
+            if let Err(e) = result {
+                error!("Response sender task failed: {}", e);
             }
         }
         _ = tokio::signal::ctrl_c() => {
@@ -98,20 +147,39 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Run the mempool streaming service.
-async fn run_mempool_service(
-    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
-    wallet: &Wallet,
+// =============================================================================
+// Mempool Monitor
+// =============================================================================
+
+/// Monitor mempool for verification requests.
+///
+/// This task only needs the UFVK for decryption - it doesn't own the wallet.
+/// Valid requests are sent to the channel for the response sender to process.
+async fn run_mempool_monitor(
+    url: &str,
+    ufvk: &UnifiedFullViewingKey,
     otp_secret: &[u8],
+    request_tx: mpsc::Sender<VerificationRequest>,
 ) -> Result<()> {
-    info!("Starting mempool streaming service");
+    info!("Starting mempool monitor");
 
     loop {
-        info!("Connecting to mempool stream...");
+        // Create fresh connection for each reconnect
+        let mut client = match CompactTxStreamerClient::connect(url.to_string()).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to connect to lightwalletd: {}", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
 
-        let result = scan::stream_mempool(client, |tx, height| {
-            // Decrypt memo using wallet
-            if let Some(decrypted) = wallet.decrypt_memo(&tx, height) {
+        info!("Connected to mempool stream");
+
+        let request_tx = request_tx.clone();
+        let result = scan::stream_mempool(&mut client, |tx, height| {
+            // Decrypt memo using UFVK directly (no wallet borrow needed)
+            if let Some(decrypted) = wallet::decrypt_memo_with_ufvk(ufvk, &tx, height) {
                 let txid_hex = hex::encode(decrypted.txid.as_ref());
                 let memo_text = memo_rules::extract_memo_text(&decrypted.memo);
 
@@ -119,37 +187,28 @@ async fn run_mempool_service(
                 if let Some(verification) = memo_rules::validate_memo(&memo_text) {
                     // Check payment amount
                     if memo_rules::is_valid_payment(decrypted.value) {
-                        // Generate OTP
+                        // Generate OTP for logging
                         let otp = otp_rules::generate_otp(otp_secret, &verification.session_id);
-                        let response_memo = otp_rules::build_otp_memo(&otp);
 
                         info!("=== VERIFICATION REQUEST ===");
                         info!("Session: {}", verification.session_id);
                         info!("Payment: {} zats ✓", u64::from(decrypted.value));
                         info!("Request tx: {}", txid_hex);
                         info!("Generated OTP: {}", otp);
-                        info!("Response memo: {}", response_memo);
                         info!("Reply to: {}", verification.user_address);
                         info!("============================");
 
-                        // TODO: Send OTP response transaction
-                        // let request = otp_rules::create_otp_transaction_request(
-                        //     &otp_rules::OtpResponseParams {
-                        //         recipient_address: verification.user_address.clone(),
-                        //         otp_code: otp.clone(),
-                        //         request_txid_hex: txid_hex.clone(),
-                        //     },
-                        // )?;
-                        //
-                        // match wallet.send_transaction(&mut client, request).await {
-                        //     Ok(response_txid) => {
-                        //         info!("OTP sent! Response tx: {}", hex::encode(response_txid.as_ref()));
-                        //     }
-                        //     Err(e) => {
-                        //         error!("Failed to send OTP: {}", e);
-                        //         // TODO: Add to retry queue
-                        //     }
-                        // }
+                        // Send to response sender task
+                        let request = VerificationRequest {
+                            session_id: verification.session_id,
+                            user_address: verification.user_address,
+                            request_txid: decrypted.txid,
+                            value: decrypted.value,
+                        };
+
+                        if let Err(e) = request_tx.try_send(request) {
+                            error!("Failed to queue verification request: {}", e);
+                        }
                     } else {
                         warn!(
                             "Payment too low: {} zats < {} minimum (tx={})",
@@ -167,13 +226,86 @@ async fn run_mempool_service(
         match result {
             Ok(()) => {
                 info!("Mempool stream closed, reconnecting in 500ms...");
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
             Err(e) => {
                 error!("Mempool stream error: {}", e);
                 warn!("Reconnecting in 30s...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
             }
         }
     }
+}
+
+// =============================================================================
+// Response Sender
+// =============================================================================
+
+/// Send OTP responses to verification requests.
+///
+/// This task owns the wallet and handles syncing before sending.
+async fn run_response_sender(
+    url: &str,
+    mut wallet: Wallet,
+    mut request_rx: mpsc::Receiver<VerificationRequest>,
+) -> Result<()> {
+    info!("Starting response sender");
+
+    // Create dedicated connection for sending
+    let mut client = CompactTxStreamerClient::connect(url.to_string()).await?;
+
+    // Read OTP secret from env (needed for generating OTP in response)
+    let otp_secret_hex = env::var("OTP_SECRET").expect("OTP_SECRET required");
+    let otp_secret = hex::decode(&otp_secret_hex)?;
+
+    while let Some(request) = request_rx.recv().await {
+        let txid_hex = hex::encode(request.request_txid.as_ref());
+        info!(
+            "Processing verification request: {} ({} zats)",
+            txid_hex,
+            u64::from(request.value)
+        );
+
+        // Sync wallet before sending to ensure we have spendable notes
+        if let Err(e) = wallet.sync(&mut client).await {
+            error!("Sync failed before sending response: {}", e);
+            // Continue to next request - don't block the queue
+            continue;
+        }
+
+        // Generate OTP
+        let otp = otp_rules::generate_otp(&otp_secret, &request.session_id);
+
+        // Create transaction request
+        let params = otp_rules::OtpResponseParams {
+            recipient_address: request.user_address.clone(),
+            otp_code: otp.clone(),
+            request_txid_hex: txid_hex.clone(),
+        };
+
+        let tx_request = match otp_rules::create_otp_transaction_request(&params) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to create transaction request: {}", e);
+                continue;
+            }
+        };
+
+        // Send the response transaction
+        match wallet.send_transaction(&mut client, tx_request).await {
+            Ok(response_txid) => {
+                info!(
+                    "OTP response sent! tx={} (reply to {})",
+                    hex::encode(response_txid.as_ref()),
+                    txid_hex
+                );
+            }
+            Err(e) => {
+                error!("Failed to send OTP response: {}", e);
+                // TODO: Add to retry queue
+            }
+        }
+    }
+
+    Ok(())
 }

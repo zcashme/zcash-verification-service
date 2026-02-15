@@ -34,13 +34,13 @@ use zcash_client_backend::{
     zip321::TransactionRequest,
     TransferType,
 };
-use zcash_proofs::prover::LocalTxProver;
 use zcash_client_sqlite::{
     util::SystemClock, wallet::commitment_tree, wallet::init::init_wallet_db, AccountUuid,
     ReceivedNoteId, WalletDb,
 };
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_primitives::transaction::{Transaction, TxId};
+use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
     consensus::{BlockHeight, BranchId, MainNetwork},
     memo::MemoBytes,
@@ -146,15 +146,6 @@ impl Wallet {
         })
     }
 
-    // =========================================================================
-    // Database Access (for sync)
-    // =========================================================================
-
-    /// Get mutable access to the wallet database for sync operations.
-    pub fn db_mut(&mut self) -> &mut WalletDbType {
-        &mut self.db
-    }
-
     /// Sync wallet with the blockchain.
     ///
     /// Downloads compact blocks and scans for relevant transactions.
@@ -233,7 +224,10 @@ impl Wallet {
         }
 
         if enhanced_count > 0 {
-            info!("Enhanced {} transactions with full memo data", enhanced_count);
+            info!(
+                "Enhanced {} transactions with full memo data",
+                enhanced_count
+            );
         }
 
         Ok(())
@@ -333,6 +327,11 @@ impl Wallet {
         self.get_unified_address()
     }
 
+    /// Get the unified full viewing key for decryption.
+    pub fn get_ufvk(&self) -> zcash_keys::keys::UnifiedFullViewingKey {
+        self.usk.to_unified_full_viewing_key()
+    }
+
     // =========================================================================
     // Balance Methods
     // =========================================================================
@@ -355,60 +354,52 @@ impl Wallet {
         })
     }
 
-    // =========================================================================
-    // Memo Decryption Methods
-    // =========================================================================
+}
 
-    /// Decrypt memos from a transaction.
-    ///
-    /// Uses the wallet's viewing key to decrypt any outputs addressed to us.
-    /// Returns only incoming transfers (not change or outgoing).
-    pub fn decrypt_memo(&self, tx: &Transaction, height: BlockHeight) -> Option<DecryptedMemo> {
-        let ufvk = self.usk.to_unified_full_viewing_key();
+// =============================================================================
+// Standalone Decryption
+// =============================================================================
 
-        // Build the UFVK map (we only have one account)
-        let mut ufvks = HashMap::new();
-        ufvks.insert(0u32, ufvk);
+/// Decrypt memos from a transaction using a UFVK.
+pub fn decrypt_memo_with_ufvk(
+    ufvk: &zcash_keys::keys::UnifiedFullViewingKey,
+    tx: &Transaction,
+    height: BlockHeight,
+) -> Option<DecryptedMemo> {
+    let mut ufvks = HashMap::new();
+    ufvks.insert(0u32, ufvk.clone());
 
-        // Use the unified decrypt_transaction API from zcash_client_backend
-        let decrypted = decrypt_transaction(
-            &MainNetwork,
-            Some(height),
-            None, // chain_tip not needed for mempool
-            tx,
-            &ufvks,
-        );
+    let decrypted = decrypt_transaction(&MainNetwork, Some(height), None, tx, &ufvks);
 
-        // Process Sapling outputs first
-        for output in decrypted.sapling_outputs() {
-            if !matches!(output.transfer_type(), TransferType::Incoming) {
-                continue;
-            }
-
-            debug!("Decrypted Sapling memo");
-            return Some(DecryptedMemo {
-                txid: tx.txid(),
-                memo: output.memo().clone(),
-                value: output.note_value(),
-            });
+    // Process Sapling outputs first
+    for output in decrypted.sapling_outputs() {
+        if !matches!(output.transfer_type(), TransferType::Incoming) {
+            continue;
         }
 
-        // Process Orchard outputs
-        for output in decrypted.orchard_outputs() {
-            if !matches!(output.transfer_type(), TransferType::Incoming) {
-                continue;
-            }
-
-            debug!("Decrypted Orchard memo");
-            return Some(DecryptedMemo {
-                txid: tx.txid(),
-                memo: output.memo().clone(),
-                value: output.note_value(),
-            });
-        }
-
-        None
+        debug!("Decrypted Sapling memo");
+        return Some(DecryptedMemo {
+            txid: tx.txid(),
+            memo: output.memo().clone(),
+            value: output.note_value(),
+        });
     }
+
+    // Process Orchard outputs
+    for output in decrypted.orchard_outputs() {
+        if !matches!(output.transfer_type(), TransferType::Incoming) {
+            continue;
+        }
+
+        debug!("Decrypted Orchard memo");
+        return Some(DecryptedMemo {
+            txid: tx.txid(),
+            memo: output.memo().clone(),
+            value: output.note_value(),
+        });
+    }
+
+    None
 }
 
 // =============================================================================
