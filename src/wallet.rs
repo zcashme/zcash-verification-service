@@ -8,6 +8,7 @@
 //! Network operations (streaming, broadcasting) are handled separately.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
@@ -24,6 +25,7 @@ use zcash_client_backend::{
         AccountBirthday, WalletRead, WalletWrite,
     },
     decrypt_transaction,
+    fees::{zip317::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule},
     proto::service::{compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction},
     wallet::OvkPolicy,
     zip321::TransactionRequest,
@@ -40,6 +42,7 @@ use zcash_protocol::{
     consensus::{BlockHeight, MainNetwork},
     memo::MemoBytes,
     value::Zatoshis,
+    ShieldedProtocol,
 };
 
 // =============================================================================
@@ -188,7 +191,7 @@ impl Wallet {
         request: TransactionRequest,
     ) -> Result<TxId> {
         let input_selector = GreedyInputSelector::new();
-        let change_strategy = crate::otp_rules::create_change_strategy();
+        let change_strategy = create_change_strategy();
 
         // Step 1: Propose transfer (select inputs)
         info!("Proposing transfer...");
@@ -345,4 +348,24 @@ impl Wallet {
 
         None
     }
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Create the change strategy for transactions.
+///
+/// Uses Sapling for change outputs (widely compatible) with ZIP-317 fees.
+fn create_change_strategy<I>() -> MultiOutputChangeStrategy<StandardFeeRule, I> {
+    MultiOutputChangeStrategy::new(
+        StandardFeeRule::Zip317,
+        None, // no memo for change
+        ShieldedProtocol::Sapling,
+        DustOutputPolicy::default(),
+        SplitPolicy::with_min_output_value(
+            NonZeroUsize::new(1).unwrap(),
+            Zatoshis::const_from_u64(5_000),
+        ),
+    )
 }

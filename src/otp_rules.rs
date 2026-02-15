@@ -1,6 +1,5 @@
 //! OTP generation and transaction proposal creation for ZVS responses.
 
-use std::num::NonZeroUsize;
 use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
@@ -9,15 +8,8 @@ use sha2::Sha256;
 use tracing::info;
 
 use zcash_address::ZcashAddress;
-use zcash_client_backend::{
-    fees::{zip317::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule},
-    zip321::{Payment, TransactionRequest},
-};
-use zcash_protocol::{
-    memo::{Memo, MemoBytes},
-    value::Zatoshis,
-    ShieldedProtocol,
-};
+use zcash_client_backend::zip321::{Payment, TransactionRequest};
+use zcash_protocol::memo::{Memo, MemoBytes};
 
 use crate::memo_rules::RESPONSE_AMOUNT;
 
@@ -87,23 +79,6 @@ pub fn create_otp_transaction_request(params: &OtpResponseParams) -> Result<Tran
 
     TransactionRequest::new(vec![payment])
         .map_err(|e| anyhow!("Failed to create transaction request: {e}"))
-}
-
-/// Create the change strategy for OTP response transactions.
-///
-/// Uses Sapling for change outputs (widely compatible) with ZIP-317 fees.
-/// The `I` generic parameter should be the wallet database type (input source).
-pub fn create_change_strategy<I>() -> MultiOutputChangeStrategy<StandardFeeRule, I> {
-    zcash_client_backend::fees::zip317::MultiOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None, // no memo for change
-        ShieldedProtocol::Sapling,
-        DustOutputPolicy::default(),
-        SplitPolicy::with_min_output_value(
-            NonZeroUsize::new(1).unwrap(),
-            Zatoshis::const_from_u64(5_000),
-        ),
-    )
 }
 
 #[cfg(test)]
