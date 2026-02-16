@@ -5,6 +5,7 @@
 //! - u-address: valid Zcash unified address for OTP response
 
 use zcash_address::ZcashAddress;
+use zcash_primitives::transaction::TxId;
 use zcash_protocol::{
     memo::{Memo, MemoBytes},
     value::Zatoshis,
@@ -27,6 +28,40 @@ const SESSION_ID_LEN: usize = 16;
 pub struct VerificationData {
     pub session_id: String,
     pub user_address: String,
+}
+
+/// A verified request ready to be processed.
+#[derive(Debug, Clone)]
+pub struct VerificationRequest {
+    pub session_id: String,
+    pub user_address: String,
+    pub request_txid: TxId,
+    pub value: Zatoshis,
+}
+
+impl VerificationRequest {
+    /// Create a verification request from memo bytes, txid, and payment value.
+    ///
+    /// Returns `Some(VerificationRequest)` if:
+    /// - Memo is valid ZVS format (zvs/session_id,u-address)
+    /// - Payment meets minimum threshold
+    ///
+    /// Returns `None` otherwise.
+    pub fn from_memo(memo_bytes: &MemoBytes, txid: TxId, value: Zatoshis) -> Option<Self> {
+        let memo_text = extract_memo_text(memo_bytes);
+        let data = validate_memo(&memo_text)?;
+
+        if !is_valid_payment(value) {
+            return None;
+        }
+
+        Some(Self {
+            session_id: data.session_id,
+            user_address: data.user_address,
+            request_txid: txid,
+            value,
+        })
+    }
 }
 
 /// Check if payment meets minimum threshold.
