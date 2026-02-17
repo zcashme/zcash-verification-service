@@ -49,3 +49,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hmac = "0.12"
 sha2 = "0.10"
 zcash_address = "0.10.1"
+
+# BIP39 mnemonic support
+bip0039 = "0.11"

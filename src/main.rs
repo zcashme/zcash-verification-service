@@ -1,12 +1,18 @@
 //! ZVS - Zcash Verification Service
 //!
 //! Streams mempool transactions and responds to verification requests in real-time.
+//!
+//! # Seed Configuration
+//!
+//! Set `MNEMONIC` environment variable to a 24-word BIP39 mnemonic phrase.
+//! Optional: `MNEMONIC_PASSPHRASE` for additional BIP39 passphrase protection.
 
 use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use bip0039::{English, Mnemonic};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use zcash_client_backend::proto::service::{
@@ -32,6 +38,34 @@ use wallet::Wallet;
 const SYNC_BLOCK_INTERVAL: u32 = 1;
 
 // =============================================================================
+// Seed Loading
+// =============================================================================
+
+/// Load wallet seed from MNEMONIC environment variable.
+///
+/// Returns the full 64-byte BIP39-derived seed for key derivation.
+fn load_seed() -> Result<Vec<u8>> {
+    let mnemonic_str = env::var("MNEMONIC")
+        .map_err(|_| anyhow!("MNEMONIC environment variable required (24-word BIP39 phrase)"))?;
+
+    let mnemonic: Mnemonic<English> = mnemonic_str
+        .trim()
+        .parse()
+        .map_err(|e| anyhow!("Invalid mnemonic: {}", e))?;
+
+    let passphrase = env::var("MNEMONIC_PASSPHRASE").unwrap_or_default();
+    let seed = mnemonic.to_seed(&passphrase);
+
+    info!(
+        "Loaded seed from MNEMONIC ({} words)",
+        mnemonic_str.split_whitespace().count()
+    );
+
+    // Return full 64-byte seed (compatible with zingolib and other Zcash wallets)
+    Ok(seed.to_vec())
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -47,7 +81,6 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let url = env::var("LIGHTWALLETD_URL").expect("LIGHTWALLETD_URL required");
-    let seed_hex = env::var("SEED_HEX").expect("SEED_HEX required");
     let birthday_height: u32 = env::var("BIRTHDAY_HEIGHT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -57,7 +90,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| PathBuf::from("./zvs_data"));
     let otp_secret = env::var("OTP_SECRET").expect("OTP_SECRET required");
 
-    let seed = hex::decode(&seed_hex)?;
+    let seed = load_seed()?;
     let otp_secret_bytes = hex::decode(&otp_secret)?;
 
     println!("ZVS - Zcash Verification Service");
