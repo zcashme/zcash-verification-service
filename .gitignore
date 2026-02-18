@@ -12,3 +12,13 @@ zvs_data/
 # External dependencies
 zcashd-verification-service/
 lightwalletd/
+librustzcash/
+zingolib/
+
+# Local scripts and config
+notify.sh
+zvs.service
+
+# Misc docs
+clean_rust_principles.md
+lightwalletd-grpc.md

@@ -106,6 +106,7 @@ pub struct Wallet {
     db: WalletDbType,
     account_id: AccountUuid,
     usk: UnifiedSpendingKey,
+    prover: LocalTxProver,
 }
 
 impl Wallet {
@@ -145,10 +146,15 @@ impl Wallet {
             (account_id, usk)
         };
 
+        info!("Loading proving parameters...");
+        let prover = LocalTxProver::bundled();
+        info!("Proving parameters loaded.");
+
         Ok(Self {
             db,
             account_id,
             usk,
+            prover,
         })
     }
 
@@ -269,12 +275,11 @@ impl Wallet {
 
         // Step 2: Create and sign transaction
         info!("Creating transaction...");
-        let prover = LocalTxProver::bundled();
         let result: Result<_, WalletError> = create_proposed_transactions(
             &mut self.db,
             &MainNetwork,
-            &prover,
-            &prover,
+            &self.prover,
+            &self.prover,
             &SpendingKeys::from_unified_spending_key(self.usk.clone()),
             OvkPolicy::Sender,
             &proposal,
