@@ -38,7 +38,7 @@ impl SupabaseClient {
     pub fn new(project_url: &str, api_key: &str, service_key: &str) -> Self {
         Self {
             client: reqwest::Client::new(),
-            base_url: format!("{}/rest/v1/wallet", project_url.trim_end_matches('/')),
+            base_url: format!("{}/rest/v1/wallet?on_conflict=txid", project_url.trim_end_matches('/')),
             api_key: api_key.to_string(),
             service_key: service_key.to_string(),
         }
