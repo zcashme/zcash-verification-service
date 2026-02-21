@@ -163,10 +163,14 @@ impl Wallet {
     /// Downloads compact blocks and scans for relevant transactions.
     /// Uses in-memory block cache (re-downloads on each run).
     /// After scanning, fetches full transactions to decrypt memos.
+    ///
+    /// Returns a Vec of WalletRows for every incoming transaction that was
+    /// enhanced during this sync. On initial sync from birthday, this is the
+    /// full transaction history. On background syncs, just the new ones.
     pub async fn sync(
         &mut self,
         client: &mut zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient<tonic::transport::Channel>,
-    ) -> Result<()> {
+    ) -> Result<Vec<crate::supabase::WalletRow>> {
         let db_cache = crate::sync::MemBlockCache::new();
 
         info!("Starting wallet sync...");
@@ -183,13 +187,15 @@ impl Wallet {
 
         info!("Wallet sync complete, processing enhancement requests...");
 
+        let ufvk = self.usk.to_unified_full_viewing_key();
+
         // Process transaction enhancement requests to fetch full transactions and decrypt memos
         let requests = self
             .db
             .transaction_data_requests()
             .map_err(|e| anyhow!("Failed to get transaction data requests: {:?}", e))?;
 
-        let mut enhanced_count = 0;
+        let mut enhanced = Vec::new();
         for request in requests {
             if let TransactionDataRequest::Enhancement(txid) = request {
                 debug!("Enhancing transaction: {}", hex::encode(txid.as_ref()));
@@ -231,18 +237,50 @@ impl Wallet {
                 decrypt_and_store_transaction(&MainNetwork, &mut self.db, &tx, mined_height)
                     .map_err(|e| anyhow!("Failed to decrypt and store transaction: {:?}", e))?;
 
-                enhanced_count += 1;
+                // Also extract the data for Supabase.
+                // decrypt_memo_with_ufvk does the same trial decryption to get
+                // the memo, value, and pool for incoming outputs.
+                let height = mined_height.unwrap_or(BlockHeight::from_u32(0));
+                if let Some(decrypted) = decrypt_memo_with_ufvk(&ufvk, &tx, height) {
+                    let memo_text = match zcash_protocol::memo::Memo::try_from(&decrypted.memo) {
+                        Ok(zcash_protocol::memo::Memo::Text(text)) => Some(text.to_string()),
+                        _ => None,
+                    };
+
+                    // Determine pool from which output decrypted
+                    let pool = {
+                        let mut ufvks = HashMap::new();
+                        ufvks.insert(0u32, ufvk.clone());
+                        let d = decrypt_transaction(&MainNetwork, Some(height), None, &tx, &ufvks);
+                        if !d.sapling_outputs().is_empty() {
+                            "sapling"
+                        } else {
+                            "orchard"
+                        }
+                    };
+
+                    enhanced.push(crate::supabase::WalletRow {
+                        txid: hex::encode(tx.txid().as_ref()),
+                        amount_zats: u64::from(decrypted.value) as i64,
+                        memo: memo_text,
+                        pool: pool.to_string(),
+                        block_height: mined_height.map(u32::from),
+                        block_time: None,
+                        status: "confirmed".to_string(),
+                        detected_at: chrono::Utc::now().to_rfc3339(),
+                    });
+                }
             }
         }
 
-        if enhanced_count > 0 {
+        if !enhanced.is_empty() {
             info!(
                 "Enhanced {} transactions with full memo data",
-                enhanced_count
+                enhanced.len()
             );
         }
 
-        Ok(())
+        Ok(enhanced)
     }
 
     // =========================================================================

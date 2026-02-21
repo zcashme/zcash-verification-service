@@ -24,10 +24,12 @@ use zcash_protocol::consensus::{BlockHeight, BranchId, MainNetwork};
 
 mod memo_rules;
 mod otp_rules;
+mod supabase;
 mod sync;
 mod wallet;
 
 use memo_rules::VerificationRequest;
+use supabase::SupabaseClient;
 use wallet::Wallet;
 
 // =============================================================================
@@ -93,9 +95,15 @@ async fn main() -> Result<()> {
     let seed = load_seed()?;
     let otp_secret_bytes = hex::decode(&otp_secret)?;
 
+    let supabase_url = env::var("SUPABASE_URL").expect("SUPABASE_URL required");
+    let supabase_anon_key = env::var("SUPABASE_ANON_KEY").expect("SUPABASE_ANON_KEY required");
+    let supabase_service_key = env::var("SUPABASE_SERVICE_KEY").expect("SUPABASE_SERVICE_KEY required");
+    let supabase = SupabaseClient::new(&supabase_url, &supabase_anon_key, &supabase_service_key);
+
     println!("ZVS - Zcash Verification Service");
     println!("=================================");
     println!("Lightwalletd: {}", url);
+    println!("Supabase:     {}", supabase_url);
     println!("Birthday height: {}", birthday_height);
     println!("Mode: Mempool streaming (real-time)");
     println!();
@@ -119,7 +127,10 @@ async fn main() -> Result<()> {
     // Initial sync
     println!("=== INITIAL SYNC ===");
     println!("Syncing wallet to chain tip...");
-    wallet.sync(&mut client).await?;
+    let synced_txs = wallet.sync(&mut client).await?;
+    if !synced_txs.is_empty() {
+        supabase.upsert_batch(&synced_txs).await?;
+    }
 
     let synced_height = wallet.get_synced_height().unwrap_or(0);
     println!("Synced to block: {}", synced_height);
@@ -153,7 +164,7 @@ async fn main() -> Result<()> {
 
     // Run the service loop (wallet is borrowed, main retains ownership)
     tokio::select! {
-        result = run_service_loop(&url, &mut wallet, &otp_secret_bytes) => {
+        result = run_service_loop(&url, &mut wallet, &otp_secret_bytes, &supabase) => {
             if let Err(e) = result {
                 error!("Service loop failed: {}", e);
             }
@@ -180,6 +191,7 @@ async fn run_service_loop(
     url: &str,
     wallet: &mut Wallet,
     otp_secret: &[u8],
+    supabase: &SupabaseClient,
 ) -> Result<()> {
     info!(
         "Starting service loop (sync every {} blocks)",
@@ -227,20 +239,26 @@ async fn run_service_loop(
                                 "Chain at {}, last sync at {} (+{} blocks). Syncing...",
                                 chain_height, last_synced_height, chain_height - last_synced_height
                             );
-                            if let Err(e) = wallet.sync(&mut client).await {
-                                error!("Background sync failed: {}", e);
-                            } else {
-                                last_synced_height = chain_height;
-                                match wallet.get_balance() {
-                                    Ok(b) => info!(
-                                        "Sync complete @ {}. Balance: {} spendable (S={}, O={})",
-                                        chain_height,
-                                        u64::from(b.spendable),
-                                        u64::from(b.sapling_spendable),
-                                        u64::from(b.orchard_spendable)
-                                    ),
-                                    Err(_) => info!("Sync complete @ {}", chain_height),
+                            match wallet.sync(&mut client).await {
+                                Ok(synced_txs) => {
+                                    if !synced_txs.is_empty() {
+                                        if let Err(e) = supabase.upsert_batch(&synced_txs).await {
+                                            error!("Supabase batch upsert failed: {}", e);
+                                        }
+                                    }
+                                    last_synced_height = chain_height;
+                                    match wallet.get_balance() {
+                                        Ok(b) => info!(
+                                            "Sync complete @ {}. Balance: {} spendable (S={}, O={})",
+                                            chain_height,
+                                            u64::from(b.spendable),
+                                            u64::from(b.sapling_spendable),
+                                            u64::from(b.orchard_spendable)
+                                        ),
+                                        Err(_) => info!("Sync complete @ {}", chain_height),
+                                    }
                                 }
+                                Err(e) => error!("Background sync failed: {}", e),
                             }
                         }
                     }
@@ -257,6 +275,7 @@ async fn run_service_loop(
                                 otp_secret,
                                 wallet,
                                 &mut client,
+                                supabase,
                             ).await;
                         }
                         Ok(None) => {
@@ -290,6 +309,7 @@ async fn process_mempool_tx(
     otp_secret: &[u8],
     wallet: &mut Wallet,
     client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    supabase: &SupabaseClient,
 ) {
     // Parse transaction
     let height = if height == 0 {
@@ -315,6 +335,26 @@ async fn process_mempool_tx(
         Some(d) => d,
         None => return, // Not for us
     };
+
+    // Push every incoming transaction to Supabase (before OTP validation,
+    // so all payments are recorded regardless of memo format)
+    let memo_text = match zcash_protocol::memo::Memo::try_from(&decrypted.memo) {
+        Ok(zcash_protocol::memo::Memo::Text(text)) => Some(text.to_string()),
+        _ => None,
+    };
+    let row = supabase::WalletRow {
+        txid: hex::encode(decrypted.txid.as_ref()),
+        amount_zats: u64::from(decrypted.value) as i64,
+        memo: memo_text,
+        pool: "shielded".to_string(),
+        block_height: None,
+        block_time: None,
+        status: "mempool".to_string(),
+        detected_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Err(e) = supabase.upsert(&row).await {
+        error!("Supabase upsert failed for mempool tx: {}", e);
+    }
 
     // Create verification request (validates memo format and payment)
     let request = match VerificationRequest::from_memo(&decrypted.memo, decrypted.txid, decrypted.value) {
