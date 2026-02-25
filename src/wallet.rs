@@ -349,11 +349,7 @@ impl Wallet {
 
     /// Get the last synced block height.
     pub fn get_synced_height(&self) -> Option<u32> {
-        self.db
-            .chain_height()
-            .ok()
-            .flatten()
-            .map(|h| u32::from(h))
+        self.db.chain_height().ok().flatten().map(|h| u32::from(h))
     }
 
     /// Get the account balance.
@@ -376,7 +372,6 @@ impl Wallet {
             orchard_spendable: balance.orchard_balance().spendable_value(),
         })
     }
-
 }
 
 // =============================================================================

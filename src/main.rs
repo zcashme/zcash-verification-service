@@ -176,11 +176,7 @@ async fn main() -> Result<()> {
 /// - Streams mempool transactions and processes verification requests
 /// - Periodically syncs the wallet to pick up confirmed transactions
 /// - Sends OTP responses immediately when valid requests are detected
-async fn run_service_loop(
-    url: &str,
-    wallet: &mut Wallet,
-    otp_secret: &[u8],
-) -> Result<()> {
+async fn run_service_loop(url: &str, wallet: &mut Wallet, otp_secret: &[u8]) -> Result<()> {
     info!(
         "Starting service loop (sync every {} blocks)",
         SYNC_BLOCK_INTERVAL
@@ -317,22 +313,33 @@ async fn process_mempool_tx(
     };
 
     // Create verification request (validates memo format and payment)
-    let request = match VerificationRequest::from_memo(&decrypted.memo, decrypted.txid, decrypted.value) {
-        Some(r) => r,
-        None => {
-            // Check if it was a payment issue for logging
-            let memo_text = memo_rules::extract_memo_text(&decrypted.memo);
-            if memo_rules::validate_memo(&memo_text).is_some() {
-                warn!(
-                    "Payment too low: {} zats < {} minimum (tx={})",
-                    u64::from(decrypted.value),
-                    u64::from(memo_rules::MIN_PAYMENT),
-                    hex::encode(decrypted.txid.as_ref())
-                );
+    let request =
+        match VerificationRequest::from_memo(&decrypted.memo, decrypted.txid, decrypted.value) {
+            Some(r) => r,
+            None => {
+                let memo_text = memo_rules::extract_memo_text(&decrypted.memo);
+                let txid_hex = hex::encode(decrypted.txid.as_ref());
+
+                if memo_rules::validate_memo(&memo_text).is_some() {
+                    // Valid ZVS memo but payment too low
+                    warn!(
+                        "Payment too low: {} zats < {} minimum (tx={})",
+                        u64::from(decrypted.value),
+                        u64::from(memo_rules::MIN_PAYMENT),
+                        txid_hex
+                    );
+                } else {
+                    // Incoming transaction that isn't a verification request
+                    info!(
+                        "Incoming transaction: {} zats, memo=\"{}\" (tx={})",
+                        u64::from(decrypted.value),
+                        memo_text,
+                        txid_hex
+                    );
+                }
+                return;
             }
-            return;
-        }
-    };
+        };
 
     // Log the verification request
     let txid_hex = hex::encode(request.request_txid.as_ref());

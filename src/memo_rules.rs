@@ -1,6 +1,7 @@
 //! Memo validation for ZVS verification requests.
 //!
-//! Memo format: `zvs/session_id,u-address`
+//! Memo format: `(DO NOT MODIFY){zvs/session_id,u-address}`
+//! - Content between first `{` and `}` is parsed
 //! - session_id: 16 digits (entropy for unique OTPs)
 //! - u-address: valid Zcash unified address for OTP response
 
@@ -12,7 +13,7 @@ use zcash_protocol::{
 };
 
 /// Minimum payment required for a verification request.
-pub const MIN_PAYMENT: Zatoshis = Zatoshis::const_from_u64(2_000);
+pub const MIN_PAYMENT: Zatoshis = Zatoshis::const_from_u64(200_000);
 
 /// Prefix identifying a ZVS verification request.
 const ZVS_PREFIX: &str = "zvs/";
@@ -40,7 +41,7 @@ impl VerificationRequest {
     /// Create a verification request from memo bytes, txid, and payment value.
     ///
     /// Returns `Some(VerificationRequest)` if:
-    /// - Memo is valid ZVS format (zvs/session_id,u-address)
+    /// - Memo is valid ZVS format: (DO NOT MODIFY){zvs/session_id,u-address}
     /// - Payment meets minimum threshold
     ///
     /// Returns `None` otherwise.
@@ -68,14 +69,25 @@ pub fn is_valid_payment(value: Zatoshis) -> bool {
 
 /// Parse and validate a ZVS verification memo.
 ///
-/// Expected format: `zvs/session_id,u-address`
+/// Expected format: `(DO NOT MODIFY){zvs/session_id,u-address}`
+/// - Extracts content between first `{` and `}`
 /// - session_id: exactly 16 digits
 /// - u-address: valid Zcash unified address
 ///
 /// Returns `Some(VerificationData)` if valid, `None` otherwise.
 pub fn validate_memo(memo: &str) -> Option<VerificationData> {
+    let trimmed = memo.trim();
+
+    // Extract content between first { and }
+    let start = trimmed.find('{')? + 1;
+    let end = trimmed.find('}')?;
+    if start >= end {
+        return None;
+    }
+    let inner = &trimmed[start..end];
+
     // Must start with "zvs/"
-    let rest = memo.trim().strip_prefix(ZVS_PREFIX)?;
+    let rest = inner.strip_prefix(ZVS_PREFIX)?;
 
     // Split into session_id and u-address
     let (session_id, user_address) = rest.split_once(',')?;
@@ -123,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_valid_memo() {
-        let memo = format!("zvs/1234567890123456,{}", TEST_ADDRESS);
+        let memo = format!("(DO NOT MODIFY){{zvs/1234567890123456,{}}}", TEST_ADDRESS);
         let result = validate_memo(&memo);
         assert!(result.is_some());
         let data = result.unwrap();
@@ -133,56 +145,62 @@ mod tests {
 
     #[test]
     fn test_valid_memo_with_whitespace() {
-        let memo = format!("  zvs/1234567890123456,{}  ", TEST_ADDRESS);
+        let memo = format!("  (DO NOT MODIFY){{zvs/1234567890123456,{}}}  ", TEST_ADDRESS);
         let result = validate_memo(&memo);
         assert!(result.is_some());
     }
 
     #[test]
-    fn test_invalid_prefix() {
-        let memo = format!("notzvs/1234567890123456,{}", TEST_ADDRESS);
+    fn test_valid_memo_arbitrary_prefix() {
+        let memo = format!("anything{{zvs/1234567890123456,{}}}", TEST_ADDRESS);
+        assert!(validate_memo(&memo).is_some());
+    }
+
+    #[test]
+    fn test_invalid_prefix_inside_brackets() {
+        let memo = format!("(DO NOT MODIFY){{notzvs/1234567890123456,{}}}", TEST_ADDRESS);
         assert!(validate_memo(&memo).is_none());
     }
 
     #[test]
-    fn test_uppercase_prefix_rejected() {
-        let memo = format!("ZVS/1234567890123456,{}", TEST_ADDRESS);
+    fn test_no_brackets() {
+        let memo = format!("zvs/1234567890123456,{}", TEST_ADDRESS);
         assert!(validate_memo(&memo).is_none());
     }
 
     #[test]
-    fn test_missing_prefix() {
-        let memo = format!("1234567890123456,{}", TEST_ADDRESS);
-        assert!(validate_memo(&memo).is_none());
+    fn test_empty_brackets() {
+        let memo = "{}";
+        assert!(validate_memo(memo).is_none());
     }
 
     #[test]
     fn test_session_id_too_short() {
-        let memo = format!("zvs/123456789012345,{}", TEST_ADDRESS); // 15 digits
+        let memo = format!("(DO NOT MODIFY){{zvs/123456789012345,{}}}", TEST_ADDRESS);
         assert!(validate_memo(&memo).is_none());
     }
 
     #[test]
     fn test_session_id_too_long() {
-        let memo = format!("zvs/12345678901234567,{}", TEST_ADDRESS); // 17 digits
+        let memo = format!("(DO NOT MODIFY){{zvs/12345678901234567,{}}}", TEST_ADDRESS);
         assert!(validate_memo(&memo).is_none());
     }
 
     #[test]
     fn test_session_id_non_digit() {
-        let memo = format!("zvs/123456789012345a,{}", TEST_ADDRESS); // 'a' not digit
+        let memo = format!("(DO NOT MODIFY){{zvs/123456789012345a,{}}}", TEST_ADDRESS);
         assert!(validate_memo(&memo).is_none());
     }
 
     #[test]
     fn test_invalid_address() {
-        let memo = "zvs/1234567890123456,u1notavalidaddress";
+        let memo = "(DO NOT MODIFY){zvs/1234567890123456,u1notavalidaddress}";
         assert!(validate_memo(memo).is_none());
     }
 
     #[test]
     fn test_missing_address() {
-        let memo = "zvs/1234567890123456";
+        let memo = "(DO NOT MODIFY){zvs/1234567890123456}";
         assert!(validate_memo(memo).is_none());
     }
 

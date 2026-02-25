@@ -73,7 +73,10 @@ impl BlockSource for MemBlockCache {
 
 #[async_trait]
 impl BlockCache for MemBlockCache {
-    fn get_tip_height(&self, range: Option<&ScanRange>) -> Result<Option<BlockHeight>, Self::Error> {
+    fn get_tip_height(
+        &self,
+        range: Option<&ScanRange>,
+    ) -> Result<Option<BlockHeight>, Self::Error> {
         let inner = self.0.read().unwrap();
         if let Some(range) = range {
             let r = range.block_range();
