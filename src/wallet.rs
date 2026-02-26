@@ -1,11 +1,8 @@
-//! ZVS Wallet - Wallet operations for Zcash Verification Service
+//! ZVS Wallet - local-only wallet operations.
 //!
-//! This module provides wallet functionality over zcash_client_sqlite:
-//! - Account management
-//! - Address generation
-//! - Memo decryption
-//!
-//! Network operations (streaming, broadcasting) are handled separately.
+//! This module is purely local: keys, database, proving, and signing.
+//! It performs NO network I/O. Broadcasting and block fetching are handled
+//! by `mempool.rs` and `sync.rs` respectively.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -15,21 +12,16 @@ use anyhow::{anyhow, Result};
 use secrecy::Secret;
 use tracing::{debug, info};
 
-use tonic::transport::Channel;
 use zcash_client_backend::{
     data_api::{
         wallet::{
-            create_proposed_transactions, decrypt_and_store_transaction,
-            input_selection::GreedyInputSelector, propose_transfer, ConfirmationsPolicy,
-            SpendingKeys,
+            create_proposed_transactions, input_selection::GreedyInputSelector, propose_transfer,
+            ConfirmationsPolicy, SpendingKeys,
         },
-        AccountBirthday, TransactionDataRequest, WalletRead, WalletWrite,
+        AccountBirthday, WalletRead, WalletWrite,
     },
     decrypt_transaction,
     fees::{zip317::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule},
-    proto::service::{
-        compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction, TxFilter,
-    },
     wallet::OvkPolicy,
     zip321::TransactionRequest,
     TransferType,
@@ -42,7 +34,7 @@ use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
-    consensus::{BlockHeight, BranchId, MainNetwork},
+    consensus::{BlockHeight, MainNetwork},
     memo::MemoBytes,
     value::Zatoshis,
     ShieldedProtocol,
@@ -97,11 +89,9 @@ type WalletError = zcash_client_backend::data_api::error::Error<
 // Wallet
 // =============================================================================
 
-/// ZVS Wallet - handles all Zcash wallet operations.
+/// ZVS Wallet - handles all local Zcash wallet operations.
 ///
-/// The wallet is purely local - it handles keys, database, and crypto.
-/// Network operations (streaming, broadcasting) are handled by the caller
-/// who passes a client when needed.
+/// Purely local: keys, database, proving, signing. No network I/O.
 pub struct Wallet {
     db: WalletDbType,
     account_id: AccountUuid,
@@ -158,105 +148,36 @@ impl Wallet {
         })
     }
 
-    /// Sync wallet with the blockchain.
+    // =========================================================================
+    // Database Access (for sync task)
+    // =========================================================================
+
+    /// Mutable reference to the wallet database.
     ///
-    /// Downloads compact blocks and scans for relevant transactions.
-    /// Uses in-memory block cache (re-downloads on each run).
-    /// After scanning, fetches full transactions to decrypt memos.
-    pub async fn sync(
-        &mut self,
-        client: &mut zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient<tonic::transport::Channel>,
-    ) -> Result<()> {
-        let db_cache = crate::sync::MemBlockCache::new();
+    /// Used by `sync::sync_wallet()` which needs direct DB access for
+    /// `zcash_client_backend::sync::run()` and transaction enhancement.
+    pub fn db_mut(&mut self) -> &mut WalletDbType {
+        &mut self.db
+    }
 
-        info!("Starting wallet sync...");
-
-        zcash_client_backend::sync::run(
-            client,
-            &MainNetwork,
-            &db_cache,
-            &mut self.db,
-            10_000, // batch size
-        )
-        .await
-        .map_err(|e| anyhow!("Sync failed: {:?}", e))?;
-
-        info!("Wallet sync complete, processing enhancement requests...");
-
-        // Process transaction enhancement requests to fetch full transactions and decrypt memos
-        let requests = self
-            .db
-            .transaction_data_requests()
-            .map_err(|e| anyhow!("Failed to get transaction data requests: {:?}", e))?;
-
-        let mut enhanced_count = 0;
-        for request in requests {
-            if let TransactionDataRequest::Enhancement(txid) = request {
-                debug!("Enhancing transaction: {}", hex::encode(txid.as_ref()));
-
-                // Fetch full transaction from lightwalletd
-                let response = client
-                    .get_transaction(TxFilter {
-                        block: None,
-                        index: 0,
-                        hash: txid.as_ref().to_vec(),
-                    })
-                    .await
-                    .map_err(|e| {
-                        anyhow!(
-                            "Failed to fetch transaction {}: {:?}",
-                            hex::encode(txid.as_ref()),
-                            e
-                        )
-                    })?;
-
-                let raw_tx = response.into_inner();
-
-                // Get the mined height for this transaction
-                let mined_height = self
-                    .db
-                    .get_tx_height(txid)
-                    .map_err(|e| anyhow!("Failed to get tx height: {:?}", e))?;
-
-                // Determine the branch ID for parsing
-                let branch_id = mined_height
-                    .map(|h| BranchId::for_height(&MainNetwork, h))
-                    .unwrap_or(BranchId::Nu5);
-
-                // Parse the transaction
-                let tx = Transaction::read(&raw_tx.data[..], branch_id)
-                    .map_err(|e| anyhow!("Failed to parse transaction: {:?}", e))?;
-
-                // Decrypt and store the transaction (this updates memos in the DB)
-                decrypt_and_store_transaction(&MainNetwork, &mut self.db, &tx, mined_height)
-                    .map_err(|e| anyhow!("Failed to decrypt and store transaction: {:?}", e))?;
-
-                enhanced_count += 1;
-            }
-        }
-
-        if enhanced_count > 0 {
-            info!(
-                "Enhanced {} transactions with full memo data",
-                enhanced_count
-            );
-        }
-
-        Ok(())
+    /// Read-only reference to the wallet database.
+    pub fn db(&self) -> &WalletDbType {
+        &self.db
     }
 
     // =========================================================================
-    // Transaction Sending
+    // Transaction Creation (local only — no broadcast)
     // =========================================================================
 
-    /// Send a transaction.
+    /// Create a signed transaction from a ZIP-321 request.
     ///
-    /// Takes a ZIP-321 transaction request, builds the transaction, and broadcasts it.
-    pub async fn send_transaction(
+    /// Proposes inputs, creates and signs the transaction, serializes it.
+    /// Returns the txid and raw bytes ready for broadcast.
+    /// Does NOT broadcast — the caller is responsible for that.
+    pub fn create_transaction(
         &mut self,
-        client: &mut CompactTxStreamerClient<Channel>,
         request: TransactionRequest,
-    ) -> Result<TxId> {
+    ) -> Result<(TxId, Vec<u8>)> {
         let input_selector = GreedyInputSelector::new();
         let change_strategy = create_change_strategy();
 
@@ -288,7 +209,7 @@ impl Wallet {
 
         let txid = *txids.first();
 
-        // Step 3: Get raw transaction from DB
+        // Step 3: Get raw transaction bytes from DB
         let tx_data = self
             .db
             .get_transaction(txid)
@@ -300,26 +221,7 @@ impl Wallet {
             .write(&mut raw_tx_bytes)
             .map_err(|e| anyhow!("Failed to serialize tx: {:?}", e))?;
 
-        // Step 4: Broadcast
-        info!("Broadcasting transaction...");
-        let response = client
-            .send_transaction(RawTransaction {
-                data: raw_tx_bytes,
-                height: 0,
-            })
-            .await
-            .map_err(|e| anyhow!("Broadcast failed: {:?}", e))?;
-
-        let send_response = response.into_inner();
-        if send_response.error_code != 0 {
-            return Err(anyhow!(
-                "Broadcast rejected: {}",
-                send_response.error_message
-            ));
-        }
-
-        info!("Transaction sent: {}", hex::encode(txid.as_ref()));
-        Ok(txid)
+        Ok((txid, raw_tx_bytes))
     }
 
     // =========================================================================
@@ -349,7 +251,7 @@ impl Wallet {
 
     /// Get the last synced block height.
     pub fn get_synced_height(&self) -> Option<u32> {
-        self.db.chain_height().ok().flatten().map(|h| u32::from(h))
+        self.db.chain_height().ok().flatten().map(u32::from)
     }
 
     /// Get the account balance.

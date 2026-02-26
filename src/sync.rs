@@ -2,24 +2,31 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tonic::transport::Channel;
+use tracing::{debug, error, info};
 
 use zcash_client_backend::{
     data_api::{
         chain::{BlockCache, BlockSource},
         scanning::ScanRange,
-        AccountBirthday,
+        wallet::decrypt_and_store_transaction,
+        AccountBirthday, TransactionDataRequest, WalletRead,
     },
     proto::{
         compact_formats::CompactBlock,
-        service::{compact_tx_streamer_client::CompactTxStreamerClient, BlockId},
+        service::{compact_tx_streamer_client::CompactTxStreamerClient, BlockId, ChainSpec, TxFilter},
     },
 };
-use zcash_protocol::consensus::BlockHeight;
+use zcash_primitives::transaction::Transaction;
+use zcash_protocol::consensus::{BlockHeight, BranchId, MainNetwork};
+
+use crate::wallet::Wallet;
 
 // =============================================================================
 // MemBlockCache - In-memory block cache for sync
@@ -151,4 +158,159 @@ pub async fn fetch_birthday(
         .map_err(|_| anyhow!("Failed to parse tree state into AccountBirthday"))?;
 
     Ok(birthday)
+}
+
+// =============================================================================
+// Wallet Sync
+// =============================================================================
+
+/// Sync the wallet with the blockchain.
+///
+/// Downloads compact blocks, scans for relevant transactions, and enhances
+/// discovered transactions by fetching full tx data and decrypting memos.
+///
+/// Extracted from the former `Wallet::sync()` method so that all network I/O
+/// lives outside `wallet.rs`.
+pub async fn sync_wallet(
+    client: &mut CompactTxStreamerClient<Channel>,
+    wallet: &mut Wallet,
+) -> Result<()> {
+    let db_cache = MemBlockCache::new();
+
+    info!("Starting wallet sync...");
+
+    zcash_client_backend::sync::run(
+        client,
+        &MainNetwork,
+        &db_cache,
+        wallet.db_mut(),
+        10_000, // batch size
+    )
+    .await
+    .map_err(|e| anyhow!("Sync failed: {:?}", e))?;
+
+    info!("Wallet sync complete, processing enhancement requests...");
+
+    // Process transaction enhancement requests to fetch full transactions and decrypt memos
+    let requests = wallet
+        .db()
+        .transaction_data_requests()
+        .map_err(|e| anyhow!("Failed to get transaction data requests: {:?}", e))?;
+
+    let mut enhanced_count = 0;
+    for request in requests {
+        if let TransactionDataRequest::Enhancement(txid) = request {
+            debug!("Enhancing transaction: {}", hex::encode(txid.as_ref()));
+
+            // Fetch full transaction from lightwalletd
+            let response = client
+                .get_transaction(TxFilter {
+                    block: None,
+                    index: 0,
+                    hash: txid.as_ref().to_vec(),
+                })
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to fetch transaction {}: {:?}",
+                        hex::encode(txid.as_ref()),
+                        e
+                    )
+                })?;
+
+            let raw_tx = response.into_inner();
+
+            // Get the mined height for this transaction
+            let mined_height = wallet
+                .db()
+                .get_tx_height(txid)
+                .map_err(|e| anyhow!("Failed to get tx height: {:?}", e))?;
+
+            // Determine the branch ID for parsing
+            let branch_id = mined_height
+                .map(|h| BranchId::for_height(&MainNetwork, h))
+                .unwrap_or(BranchId::Nu5);
+
+            // Parse the transaction
+            let tx = Transaction::read(&raw_tx.data[..], branch_id)
+                .map_err(|e| anyhow!("Failed to parse transaction: {:?}", e))?;
+
+            // Decrypt and store the transaction (this updates memos in the DB)
+            decrypt_and_store_transaction(&MainNetwork, wallet.db_mut(), &tx, mined_height)
+                .map_err(|e| anyhow!("Failed to decrypt and store transaction: {:?}", e))?;
+
+            enhanced_count += 1;
+        }
+    }
+
+    if enhanced_count > 0 {
+        info!(
+            "Enhanced {} transactions with full memo data",
+            enhanced_count
+        );
+    }
+
+    Ok(())
+}
+
+/// Background sync loop. Runs forever, syncing the wallet periodically.
+///
+/// Checks chain height, and syncs when new blocks are available.
+/// Logs errors and continues — never returns under normal operation.
+pub async fn run_sync_loop(
+    mut client: CompactTxStreamerClient<Channel>,
+    wallet: Arc<tokio::sync::Mutex<Wallet>>,
+    sync_interval_secs: u64,
+) -> ! {
+    let mut last_synced_height: u32 = {
+        let w = wallet.lock().await;
+        w.get_synced_height().unwrap_or(0)
+    };
+
+    let mut interval = tokio::time::interval(Duration::from_secs(sync_interval_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+
+        // Check chain height
+        let chain_height = match client.get_latest_block(ChainSpec {}).await {
+            Ok(resp) => resp.into_inner().height as u32,
+            Err(e) => {
+                error!("Failed to get chain height: {}", e);
+                continue;
+            }
+        };
+
+        if chain_height <= last_synced_height {
+            continue;
+        }
+
+        info!(
+            "Chain at {}, last sync at {} (+{} blocks). Syncing...",
+            chain_height,
+            last_synced_height,
+            chain_height - last_synced_height
+        );
+
+        let mut w = wallet.lock().await;
+        match sync_wallet(&mut client, &mut w).await {
+            Ok(()) => {
+                last_synced_height = chain_height;
+                match w.get_balance() {
+                    Ok(b) => info!(
+                        "Sync complete @ {}. Balance: {} spendable (S={}, O={})",
+                        chain_height,
+                        u64::from(b.spendable),
+                        u64::from(b.sapling_spendable),
+                        u64::from(b.orchard_spendable)
+                    ),
+                    Err(_) => info!("Sync complete @ {}", chain_height),
+                }
+            }
+            Err(e) => {
+                error!("Background sync failed: {}", e);
+            }
+        }
+    }
 }
