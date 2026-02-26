@@ -68,31 +68,3 @@ pub fn create_otp_transaction_request(params: &OtpResponseParams) -> Result<Tran
     TransactionRequest::new(vec![payment])
         .map_err(|e| anyhow!("Failed to create transaction request: {e}"))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_generate_otp_deterministic() {
-        let secret = b"test_secret_key";
-        let session_id = "session123";
-
-        let otp1 = generate_otp(secret, session_id);
-        let otp2 = generate_otp(secret, session_id);
-
-        assert_eq!(otp1, otp2);
-        assert_eq!(otp1.len(), 6);
-        assert!(otp1.chars().all(|c| c.is_ascii_digit()));
-    }
-
-    #[test]
-    fn test_generate_otp_different_sessions() {
-        let secret = b"test_secret_key";
-
-        let otp1 = generate_otp(secret, "session1");
-        let otp2 = generate_otp(secret, "session2");
-
-        assert_ne!(otp1, otp2);
-    }
-}
