@@ -3,7 +3,6 @@
 //! Streams mempool transactions and responds to verification requests in real-time.
 //!
 //! Architecture:
-//! - `client.rs`  — single gRPC connection, cloned for each task
 //! - `wallet.rs`  — local-only: keys, DB, prove, sign (no network I/O)
 //! - `sync.rs`    — background wallet sync loop
 //! - `mempool.rs` — hot path: stream, decrypt, dedup, create tx, broadcast
@@ -20,8 +19,8 @@ use anyhow::{anyhow, Result};
 use bip0039::{English, Mnemonic};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 
-mod client;
 mod memo_rules;
 mod mempool;
 mod otp_rules;
@@ -102,7 +101,7 @@ async fn main() -> Result<()> {
 
     // Single gRPC connection — cheap to clone for each task
     info!("Connecting to lightwalletd at {}", url);
-    let mut client = client::connect(&url).await?;
+    let mut client = CompactTxStreamerClient::connect(url.clone()).await?;
 
     // Fetch birthday for wallet initialization (only needed if wallet.db doesn't exist)
     let birthday = sync::fetch_birthday(&mut client, birthday_height).await?;
