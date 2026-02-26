@@ -45,12 +45,6 @@ impl ProcessedTxids {
 // =============================================================================
 
 /// Run the mempool monitoring loop. Never returns under normal operation.
-///
-/// Opens a mempool stream on the existing gRPC channel. When the stream closes
-/// (typically on new block), it reopens on the same channel — no full reconnect.
-///
-/// All filtering, decryption, and validation happen *before* acquiring the
-/// wallet lock. The lock is only held for `create_transaction` (proving + signing).
 pub async fn run_mempool_loop(
     mut client: CompactTxStreamerClient<Channel>,
     wallet: Arc<tokio::sync::Mutex<Wallet>>,
@@ -160,13 +154,14 @@ async fn process_mempool_tx(
                 let memo_text = memo_rules::extract_memo_text(&decrypted.memo);
                 let txid_hex = hex::encode(decrypted.txid.as_ref());
 
-                if memo_rules::validate_memo(&memo_text).is_some() {
+                if let Some(data) = memo_rules::validate_memo(&memo_text) {
                     // Valid ZVS memo but payment too low
                     warn!(
-                        "Payment too low: {} zats < {} minimum (tx={})",
+                        "Payment too low: {} zats < {} minimum (tx={}, reply_to={})",
                         u64::from(decrypted.value),
                         u64::from(memo_rules::MIN_PAYMENT),
-                        txid_hex
+                        txid_hex,
+                        data.user_address
                     );
                 } else {
                     // Incoming transaction that isn't a verification request
