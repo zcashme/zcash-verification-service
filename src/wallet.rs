@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use secrecy::Secret;
@@ -45,7 +45,7 @@ use zcash_protocol::{
 // =============================================================================
 
 /// Account balance breakdown.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AccountBalance {
     pub total: Zatoshis,
     pub spendable: Zatoshis,
@@ -53,19 +53,8 @@ pub struct AccountBalance {
     pub orchard_spendable: Zatoshis,
 }
 
-impl Default for AccountBalance {
-    fn default() -> Self {
-        Self {
-            total: Zatoshis::ZERO,
-            spendable: Zatoshis::ZERO,
-            sapling_spendable: Zatoshis::ZERO,
-            orchard_spendable: Zatoshis::ZERO,
-        }
-    }
-}
-
 /// A decrypted memo with its associated value.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DecryptedMemo {
     pub txid: TxId,
     pub memo: MemoBytes,
@@ -97,7 +86,6 @@ pub struct Wallet {
     account_id: AccountUuid,
     usk: UnifiedSpendingKey,
     prover: LocalTxProver,
-    data_dir: PathBuf,
 }
 
 impl Wallet {
@@ -146,7 +134,6 @@ impl Wallet {
             account_id,
             usk,
             prover,
-            data_dir: data_dir.to_path_buf(),
         })
     }
 
@@ -165,11 +152,6 @@ impl Wallet {
     /// Read-only reference to the wallet database.
     pub fn db(&self) -> &WalletDbType {
         &self.db
-    }
-
-    /// Path to the data directory.
-    pub fn data_dir(&self) -> &Path {
-        &self.data_dir
     }
 
     // =========================================================================
@@ -236,15 +218,10 @@ impl Wallet {
     // =========================================================================
 
     /// Get the default unified address (Orchard + Sapling receivers).
-    pub fn get_unified_address(&self) -> Result<String> {
+    pub fn get_address(&self) -> Result<String> {
         let ufvk = self.usk.to_unified_full_viewing_key();
         let (ua, _) = ufvk.default_address(UnifiedAddressRequest::AllAvailableKeys)?;
         Ok(ua.encode(&MainNetwork))
-    }
-
-    /// Get the default address (unified).
-    pub fn get_address(&self) -> Result<String> {
-        self.get_unified_address()
     }
 
     /// Get the unified full viewing key for decryption.

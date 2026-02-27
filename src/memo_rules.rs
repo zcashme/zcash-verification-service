@@ -22,14 +22,14 @@ const ZVS_PREFIX: &str = "zvs/";
 const SESSION_ID_LEN: usize = 16;
 
 /// Extracted verification data from a valid ZVS memo.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VerificationData {
     pub session_id: String,
     pub user_address: String,
 }
 
 /// A verified request ready to be processed.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VerificationRequest {
     pub session_id: String,
     pub user_address: String,
@@ -63,7 +63,7 @@ impl VerificationRequest {
 }
 
 /// Check if payment meets minimum threshold.
-pub fn is_valid_payment(value: Zatoshis) -> bool {
+fn is_valid_payment(value: Zatoshis) -> bool {
     value >= MIN_PAYMENT
 }
 

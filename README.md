@@ -15,7 +15,7 @@ A two-factor authentication (2FA) service using shielded Zcash transactions. Use
 │   USER                                         ZVS (service wallet)         │
 │                                                                             │
 │   ┌─────────┐      tx with memo:               ┌─────────┐                  │
-│   │         │      "VERIFY:session123:u1..."   │         │                  │
+│   │         │  "{zvs/1234567890123456,u1...}"  │         │                  │
 │   │  Wallet │ ──────────────────────────────►  │  Wallet │                  │
 │   │         │                                  │         │                  │
 │   └─────────┘                                  └────┬────┘                  │
@@ -26,8 +26,8 @@ A two-factor authentication (2FA) service using shielded Zcash transactions. Use
 │        │                                            │ 4. Generate OTP       │
 │        │                                            ▼                       │
 │        │                                       ┌─────────┐                  │
-│        │       tx with memo:                   │  Build  │                  │
-│        │       "OTP:847291:ref:abc123"         │   tx    │                  │
+│        │       tx with memo: "847291"          │  Build  │                  │
+│        │       (50,000 zats)                   │   tx    │                  │
 │        └────────────────────────────────────── │         │                  │
 │                                                └─────────┘                  │
 │                                                                             │
@@ -38,17 +38,6 @@ A two-factor authentication (2FA) service using shielded Zcash transactions. Use
 
 - Rust toolchain (edition 2021)
 - Access to a lightwalletd server
-- Zcash Sapling parameters (for transaction proving)
-
-### Fetching Sapling Parameters
-
-Before running ZVS, you need the Sapling proving parameters:
-
-```bash
-./fetch-params.sh
-```
-
-Or manually download them to `~/.zcash-params/`.
 
 ## Configuration
 
@@ -57,14 +46,14 @@ ZVS is configured via environment variables. Create a `.env` file:
 ```env
 # Required
 LIGHTWALLETD_URL=https://mainnet.lightwalletd.com:9067
-SEED_HEX=<your-wallet-seed-in-hex>
+MNEMONIC=<your-24-word-BIP39-mnemonic>
 OTP_SECRET=<your-otp-secret-in-hex>
 
 # Optional
-BIRTHDAY_HEIGHT=1        # Wallet birthday height (default: 1)
-ZVS_DATA_DIR=./zvs_data  # Data directory (default: ./zvs_data)
-POLL_INTERVAL=30         # Block polling interval in seconds (default: 30)
-RUST_LOG=info            # Log level (default: info)
+BIRTHDAY_HEIGHT=1               # Wallet birthday height (default: 1)
+ZVS_DATA_DIR=./zvs_data         # Data directory (default: ./zvs_data)
+MNEMONIC_PASSPHRASE=             # BIP39 passphrase (default: empty)
+RUST_LOG=info                    # Log level (default: info)
 ```
 
 ### Environment Variables
@@ -72,11 +61,11 @@ RUST_LOG=info            # Log level (default: info)
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `LIGHTWALLETD_URL` | Yes | gRPC URL of the lightwalletd server |
-| `SEED_HEX` | Yes | Wallet seed phrase encoded as hex |
+| `MNEMONIC` | Yes | 24-word BIP39 mnemonic phrase |
 | `OTP_SECRET` | Yes | Secret key for HMAC-based OTP generation (hex-encoded) |
 | `BIRTHDAY_HEIGHT` | No | Block height when the wallet was created (default: 1) |
 | `ZVS_DATA_DIR` | No | Directory for wallet database (default: `./zvs_data`) |
-| `POLL_INTERVAL` | No | Seconds between blockchain polls (default: 30) |
+| `MNEMONIC_PASSPHRASE` | No | BIP39 passphrase for seed derivation (default: empty) |
 
 ## Building
 
@@ -98,41 +87,45 @@ On startup, ZVS will display:
 
 ## Architecture
 
-The service splits into two concurrent tasks communicating via a channel:
+Two concurrent tasks share the wallet via `Arc<Mutex>`:
 
 ```
-┌─────────────────────────┐         mpsc channel         ┌─────────────────────────┐
-│   MEMPOOL MONITOR       │  ──── VerificationRequest ──→ │   RESPONSE SENDER       │
-│   (uses UFVK only)      │                               │   (owns Wallet)         │
-│                         │                               │                         │
-│ • Streams mempool       │                               │ • Receives requests     │
-│ • Decrypts memos        │                               │ • Syncs before send     │
-│ • Validates format      │                               │ • Creates OTP tx        │
-│ • Queues valid requests │                               │ • Broadcasts response   │
-└─────────────────────────┘                               └─────────────────────────┘
+┌─────────────────────────┐                          ┌─────────────────────────┐
+│   MEMPOOL MONITOR       │                          │   BACKGROUND SYNC       │
+│                         │                          │                         │
+│ • Streams mempool txs   │                          │ • Periodic block sync   │
+│ • Decrypts memos (UFVK) │    Arc<Mutex<Wallet>>    │ • Enhances transactions │
+│ • Validates requests    │◄────────────────────────►│ • Catches missed txs    │
+│ • Sends OTP inline      │                          │ • Sends OTP inline      │
+└─────────────────────────┘                          └─────────────────────────┘
+                              ProcessedStore
+                          (dedup across restarts)
 ```
 
-- **Mempool Monitor**: Uses only the UFVK (viewing key) to decrypt incoming memos. No wallet ownership needed.
-- **Response Sender**: Owns the wallet, syncs before each send, creates and broadcasts OTP response transactions.
+- **Mempool Monitor**: Streams unconfirmed transactions in real-time, decrypts memos with the UFVK, and sends OTP responses immediately.
+- **Background Sync**: Periodically syncs the wallet to chain tip (every 30s), processes any verification requests discovered during block scanning.
+- **ProcessedStore**: Persistent deduplication — prevents re-sending OTPs after restarts by tracking processed txids on disk.
 
 ### Source Files
 
 ```
 src/
-├── main.rs       # CLI runner, mempool monitor, response sender
-├── wallet.rs     # Wallet operations and sync
-├── scan.rs       # Mempool streaming
-├── sync.rs       # Block sync utilities
-├── memo_rules.rs # Memo validation rules
-└── otp_rules.rs  # OTP generation and response formatting
+├── main.rs       # Entry point, env config, task spawning
+├── wallet.rs     # Local wallet operations (keys, DB, proving, signing)
+├── sync.rs       # Block sync with lightwalletd, in-memory block cache
+├── mempool.rs    # Real-time mempool streaming and processing
+├── memo_rules.rs # Memo format validation and parsing
+├── otp_rules.rs  # HMAC-based OTP generation and transaction requests
+└── otp_send.rs   # Shared OTP send logic and processed store
 ```
 
 ### Core Components
 
-- **`ZVS`** - Main service struct handling wallet operations and blockchain monitoring
-- **`MemoryBlockSource`** - In-memory cache for compact blocks during sync
-- **`ReceivedMemo`** - Parsed memo data from received transactions
-- **`VerificationData`** - Extracted session ID and reply address from verification requests
+- **`Wallet`** - Local-only wallet: keys, database, proving, signing (no network I/O)
+- **`MemBlockCache`** - In-memory cache for compact blocks during sync
+- **`DecryptedMemo`** - Decrypted memo with txid and value from a received transaction
+- **`VerificationRequest`** - Validated request ready for OTP generation
+- **`ProcessedStore`** - Persistent txid tracker to prevent duplicate OTPs
 
 ### Response Format
 
@@ -147,14 +140,15 @@ XXXXXX
 
 ### Verification Request
 
-Send a shielded transaction to the ZVS wallet address with a memo containing:
-- Currently: `pineapple` (test mode)
+Send a shielded transaction to the ZVS wallet address with:
+- Memo format: `{zvs/session_id,u-address}` (see Memo Format below)
+- Minimum payment: 200,000 zatoshis (0.002 ZEC)
 
 ### Verification Response
 
 ZVS responds with a shielded transaction containing:
-- Memo: `ZVS:otp:123456:req:abc123...` format
-- Amount: 10,000 zatoshis (0.0001 ZEC)
+- Memo: 6-digit OTP code (e.g., `847291`)
+- Amount: 50,000 zatoshis (0.0005 ZEC)
 
 ## Web App Integration
 
@@ -229,7 +223,7 @@ function hexToBytes(hex) {
 
 - **Shielded transactions** - All communication uses Zcash shielded pools (Sapling/Orchard)
 - **HMAC-SHA256** - OTPs are derived deterministically from session IDs
-- **No external state** - Request tracking uses the blockchain itself via memo correlation
+- **Processed store** - Persistent deduplication prevents re-sending OTPs after restarts
 
 ## Dependencies
 

@@ -19,6 +19,12 @@ zingolib/
 notify.sh
 zvs.service
 
+# Dead scripts (superseded or obsolete)
+zvs-notify.sh
+generate_seed.sh
+fetch-params.sh
+test_mempool.sh
+
 # Misc docs
 clean_rust_principles.md
 lightwalletd-grpc.md

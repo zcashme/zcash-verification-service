@@ -51,7 +51,6 @@ fn load_seed() -> Result<Vec<u8>> {
         mnemonic_str.split_whitespace().count()
     );
 
-    // Return full 64-byte seed (compatible with zingolib and other Zcash wallets)
     Ok(seed.to_vec())
 }
 

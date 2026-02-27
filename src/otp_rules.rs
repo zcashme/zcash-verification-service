@@ -1,4 +1,4 @@
-//! OTP generation and transaction proposal creation for ZVS responses.
+//! OTP generation and transaction request creation for ZVS responses.
 
 use std::str::FromStr;
 
@@ -29,7 +29,7 @@ pub fn generate_otp(secret: &[u8], session_id: &str) -> String {
 }
 
 /// Parameters for creating an OTP response transaction.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OtpResponseParams {
     pub recipient_address: String,
     pub otp_code: String,
