@@ -69,44 +69,43 @@ cargo build --release
 cargo run --release
 ```
 
-On startup, ZVS will display:
-- The wallet's unified address
-- Current balance
-- Pending verification requests with their OTPs
-- Then enter the monitoring loop
+On startup, ZVS will:
+- Perform an initial sync to chain tip
+- Display the wallet's unified address and balance
+- Process any pending verification requests found during sync
+- Enter the monitoring loop
 
 ## Architecture
 
-Two concurrent tasks share the wallet via `Arc<Mutex>`:
+The main loop exclusively owns the wallet. The mempool monitor runs in a separate task with read-only access (UFVK decryption only) and sends detected requests back via an mpsc channel.
 
 ```
 ┌─────────────────────────┐                          ┌─────────────────────────┐
-│   MEMPOOL MONITOR       │                          │   BACKGROUND SYNC       │
-│                         │                          │                         │
-│ • Streams mempool txs   │                          │ • Periodic block sync   │
-│ • Decrypts memos (UFVK) │    Arc<Mutex<Wallet>>    │ • Enhances transactions │
-│ • Validates requests    │◄────────────────────────►│ • Catches missed txs    │
-│ • Sends OTP inline      │                          │ • Sends OTP inline      │
+│   MEMPOOL MONITOR       │                          │   MAIN LOOP             │
+│   (spawned task)        │                          │   (owns wallet)         │
+│                         │     mpsc channel         │                         │
+│ • Streams mempool txs   │────────────────────────► │ • Periodic block sync   │
+│ • Decrypts memos (UFVK) │    VerificationRequest   │ • Enhances transactions │
+│ • Validates requests    │                          │ • Sends OTP responses   │
+│ • No wallet mutation    │                          │ • Deduplicates via      │
+│                         │                          │   HashSet<TxId>         │
 └─────────────────────────┘                          └─────────────────────────┘
-                              RespondedSet
-                        (in-memory dedup via HashSet)
 ```
 
-- **Mempool Monitor**: Streams unconfirmed transactions in real-time, decrypts memos with the UFVK, and sends OTP responses immediately.
-- **Background Sync**: Periodically syncs the wallet to chain tip (every 30s), processes any verification requests discovered during block scanning.
-- **RespondedSet**: In-memory `HashSet<TxId>` shared between both tasks — prevents duplicate OTPs within a single run.
+- **Mempool Monitor**: Streams unconfirmed transactions in real-time, decrypts memos with the UFVK, and forwards valid requests over the channel.
+- **Main Loop**: Periodically syncs the wallet to chain tip (every 30s), receives mempool requests from the channel, and sends OTP responses. All wallet mutation happens here.
+- **Deduplication**: An in-memory `HashSet<TxId>` prevents duplicate OTP responses across both the mempool and sync paths.
 
 ### Source Files
 
 ```
 src/
-├── main.rs       # Entry point, keys.toml config, task spawning
+├── main.rs       # Entry point, keys.toml loading, event loop
 ├── wallet.rs     # Local wallet operations (keys, DB, proving, signing)
 ├── sync.rs       # Block sync with lightwalletd, in-memory block cache
-├── mempool.rs    # Real-time mempool streaming and processing
+├── mempool.rs    # Real-time mempool streaming and memo decryption
 ├── memo_rules.rs # Memo format validation and parsing
-├── otp_rules.rs  # HMAC-based OTP generation and transaction requests
-└── otp_send.rs   # Shared OTP send logic and RespondedSet type
+└── otp_rules.rs  # OTP generation, transaction building, and broadcast
 ```
 
 ### Core Components
@@ -115,23 +114,13 @@ src/
 - **`MemBlockCache`** - In-memory cache for compact blocks during sync
 - **`DecryptedMemo`** - Decrypted memo with txid and value from a received transaction
 - **`VerificationRequest`** - Validated request ready for OTP generation
-- **`RespondedSet`** - In-memory txid set to prevent duplicate OTPs within a run
-
-### Response Format
-
-OTP response memos contain just the 6-digit code:
-```
-XXXXXX
-```
-
-- `XXXXXX` - 6-digit OTP derived from HMAC-SHA256(secret, session_id)
 
 ## Protocol
 
 ### Verification Request
 
 Send a shielded transaction to the ZVS wallet address with:
-- Memo format: `{zvs/session_id,u-address}` (see Memo Format below)
+- Memo format: `(DO NOT MODIFY){zvs/session_id,u-address}`
 - Minimum payment: 200,000 zatoshis (0.002 ZEC)
 
 ### Verification Response
@@ -140,14 +129,31 @@ ZVS responds with a shielded transaction containing:
 - Memo: 6-digit OTP code (e.g., `847291`)
 - Amount: 50,000 zatoshis (0.0005 ZEC)
 
+### Memo Format
+
+The memo payload is extracted from between the first `{` and `}`:
+
+```
+zvs/session_id,u-address
+```
+
+- `zvs/` - Prefix identifying a verification request (lowercase)
+- `session_id` - Exactly 16 ASCII digits for OTP entropy
+- `u-address` - User's unified address for OTP response
+
+Example memo:
+```
+(DO NOT MODIFY){zvs/1234567890123456,u1abc123...}
+```
+
 ## Web App Integration
 
-Web applications can independently verify OTPs by sharing the `OTP_SECRET` with ZVS:
+Web applications can independently verify OTPs by sharing the `otp_secret` with ZVS:
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
 │    Web App      │     │   User Wallet   │     │      ZVS        │
-│ (has OTP_SECRET)│     │                 │     │ (has OTP_SECRET)│
+│(has otp_secret) │     │                 │     │(has otp_secret) │
 └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
          │                       │                       │
     1. Generate                  │                       │
@@ -168,21 +174,6 @@ Web applications can independently verify OTPs by sharing the `OTP_SECRET` with 
     7. Web app computes          │                       │
        HMAC(secret, session_id)  │                       │
        and verifies match        │                       │
-```
-
-### Memo Format
-
-```
-zvs/session_id,u-address
-```
-
-- `zvs/` - Prefix identifying a verification request (lowercase)
-- `session_id` - Exactly 16 digits for OTP entropy
-- `u-address` - User's unified address for OTP response
-
-Example:
-```
-zvs/1234567890123456,u1abc123...
 ```
 
 ### Browser OTP Generation
@@ -213,7 +204,7 @@ function hexToBytes(hex) {
 
 - **Shielded transactions** - All communication uses Zcash shielded pools (Sapling/Orchard)
 - **HMAC-SHA256** - OTPs are derived deterministically from session IDs
-- **In-memory dedup** - Shared `HashSet` prevents re-sending OTPs within a single run
+- **No shared wallet state** - The mempool task only decrypts; all spending is serialized in the main loop
 
 ## Dependencies
 
