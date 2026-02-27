@@ -30,7 +30,7 @@ use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BlockHeight, BranchId, MainNetwork};
 
 use crate::memo_rules::VerificationRequest;
-use crate::otp_queue::{OtpQueue, ProcessedStore};
+use crate::otp_send::{self, ProcessedStore};
 use crate::wallet::{self, Wallet};
 
 // =============================================================================
@@ -177,7 +177,7 @@ pub async fn sync_wallet(
     client: &mut CompactTxStreamerClient<Channel>,
     wallet: &mut Wallet,
     ufvk: Option<&UnifiedFullViewingKey>,
-    queue: Option<&Arc<OtpQueue>>,
+    otp_secret: Option<&[u8]>,
     processed: Option<&Arc<std::sync::Mutex<ProcessedStore>>>,
 ) -> Result<()> {
     let db_cache = MemBlockCache::new();
@@ -245,22 +245,22 @@ pub async fn sync_wallet(
                 .map_err(|e| anyhow!("Failed to decrypt and store transaction: {:?}", e))?;
 
             // Check if this enhanced transaction is a verification request
-            if let (Some(ufvk), Some(queue), Some(processed)) = (ufvk, queue, processed) {
+            if let (Some(ufvk), Some(otp_secret), Some(processed)) = (ufvk, otp_secret, processed)
+            {
                 let height = mined_height.unwrap_or(BlockHeight::from_u32(2_600_000));
                 if let Some(decrypted) = wallet::decrypt_memo_with_ufvk(ufvk, &tx, height) {
-                    let is_processed = processed.lock().unwrap().is_processed(&decrypted.txid);
-                    if !is_processed {
+                    let already_processed =
+                        processed.lock().unwrap().is_processed(&decrypted.txid);
+                    if !already_processed {
                         if let Some(request) = VerificationRequest::from_memo(
                             &decrypted.memo,
                             decrypted.txid,
                             decrypted.value,
                         ) {
-                            if queue.insert(request) {
-                                info!(
-                                    "Enqueued verification request from block sync (tx={})",
-                                    hex::encode(decrypted.txid.as_ref())
-                                );
-                            }
+                            otp_send::send_otp_response(
+                                &request, otp_secret, wallet, client, processed,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -289,7 +289,7 @@ pub async fn run_sync_loop(
     wallet: Arc<tokio::sync::Mutex<Wallet>>,
     sync_interval_secs: u64,
     ufvk: UnifiedFullViewingKey,
-    queue: Arc<OtpQueue>,
+    otp_secret: Vec<u8>,
     processed: Arc<std::sync::Mutex<ProcessedStore>>,
 ) -> ! {
     let mut last_synced_height: u32 = {
@@ -324,7 +324,7 @@ pub async fn run_sync_loop(
         );
 
         let mut w = wallet.lock().await;
-        match sync_wallet(&mut client, &mut w, Some(&ufvk), Some(&queue), Some(&processed)).await {
+        match sync_wallet(&mut client, &mut w, Some(&ufvk), Some(otp_secret.as_slice()), Some(&processed)).await {
             Ok(()) => {
                 last_synced_height = chain_height;
                 match w.get_balance() {

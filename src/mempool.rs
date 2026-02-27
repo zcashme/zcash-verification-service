@@ -1,7 +1,7 @@
-//! Mempool monitoring — producer for the OTP queue.
+//! Mempool monitoring — real-time OTP processing.
 //!
 //! Streams mempool transactions, decrypts memos, validates verification
-//! requests, deduplicates, and enqueues valid requests for the OTP consumer.
+//! requests, deduplicates, and sends OTP responses directly inline.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,8 +18,8 @@ use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_protocol::consensus::{BlockHeight, BranchId, MainNetwork};
 
 use crate::memo_rules::{self, VerificationRequest};
-use crate::otp_queue::OtpQueue;
-use crate::wallet;
+use crate::otp_send::{self, ProcessedStore};
+use crate::wallet::{self, Wallet};
 
 // =============================================================================
 // Deduplication
@@ -46,10 +46,12 @@ impl ProcessedTxids {
 /// Run the mempool monitoring loop. Never returns under normal operation.
 pub async fn run_mempool_loop(
     mut client: CompactTxStreamerClient<Channel>,
-    queue: Arc<OtpQueue>,
+    wallet: Arc<tokio::sync::Mutex<Wallet>>,
     ufvk: UnifiedFullViewingKey,
+    otp_secret: Vec<u8>,
+    processed: Arc<std::sync::Mutex<ProcessedStore>>,
 ) -> ! {
-    let mut processed = ProcessedTxids::new();
+    let mut seen = ProcessedTxids::new();
 
     loop {
         // Open mempool stream on existing channel (no full reconnect)
@@ -72,9 +74,13 @@ pub async fn run_mempool_loop(
                         &raw_tx.data,
                         raw_tx.height as u32,
                         &ufvk,
-                        &mut processed,
-                        &queue,
-                    );
+                        &otp_secret,
+                        &mut seen,
+                        &wallet,
+                        &mut client,
+                        &processed,
+                    )
+                    .await;
                 }
                 Ok(None) => {
                     // Stream closed (new block mined)
@@ -96,14 +102,16 @@ pub async fn run_mempool_loop(
 
 /// Process a single mempool transaction.
 ///
-/// Parses, decrypts, validates, and enqueues valid verification requests.
-/// No wallet lock or network I/O needed.
-fn process_mempool_tx(
+/// Parses, decrypts, validates, and sends OTP response directly if valid.
+async fn process_mempool_tx(
     tx_data: &[u8],
     height: u32,
     ufvk: &UnifiedFullViewingKey,
-    processed: &mut ProcessedTxids,
-    queue: &Arc<OtpQueue>,
+    otp_secret: &[u8],
+    seen: &mut ProcessedTxids,
+    wallet: &Arc<tokio::sync::Mutex<Wallet>>,
+    client: &mut CompactTxStreamerClient<Channel>,
+    processed: &Arc<std::sync::Mutex<ProcessedStore>>,
 ) {
     // Parse transaction
     let height = if height == 0 {
@@ -130,8 +138,8 @@ fn process_mempool_tx(
         None => return, // Not for us
     };
 
-    // Check dedup
-    if !processed.is_new(decrypted.txid) {
+    // Check in-memory dedup (across stream reconnects)
+    if !seen.is_new(decrypted.txid) {
         info!(
             "Skipping duplicate tx: {}",
             hex::encode(decrypted.txid.as_ref())
@@ -169,9 +177,16 @@ fn process_mempool_tx(
             }
         };
 
-    // Enqueue for the OTP consumer
-    let txid_hex = hex::encode(request.request_txid.as_ref());
-    if queue.insert(request) {
-        info!("Enqueued verification request (tx={})", txid_hex);
+    // Check persistent processed store — skip if already sent
+    {
+        let ps = processed.lock().unwrap();
+        if ps.is_processed(&request.request_txid) {
+            return;
+        }
     }
+
+    // Lock wallet, send OTP response, then mark processed
+    // Note: we don't hold the std::sync::Mutex across the await
+    let mut w = wallet.lock().await;
+    otp_send::send_otp_response(&request, otp_secret, &mut w, client, processed).await;
 }
