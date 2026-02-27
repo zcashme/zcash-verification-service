@@ -19,7 +19,8 @@ zingolib/
 notify.sh
 zvs.service
 
-# Dead scripts (superseded or obsolete)
+# Notification sidecar (contains hardcoded tokens)
+zvs-notify.py
 zvs-notify.sh
 generate_seed.sh
 fetch-params.sh
