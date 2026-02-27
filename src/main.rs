@@ -2,13 +2,16 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use bip0039::{English, Mnemonic};
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
+use zcash_client_backend::proto::service::{
+    compact_tx_streamer_client::CompactTxStreamerClient, ChainSpec,
+};
+use zcash_primitives::transaction::TxId;
 
 mod memo_rules;
 mod mempool;
@@ -98,23 +101,22 @@ async fn main() -> Result<()> {
     }
     println!();
 
-    // Clone UFVK before wrapping wallet in Arc<Mutex>
     let ufvk = wallet.get_ufvk();
 
-    // In-memory set of responded request txids (not persisted across restarts)
-    let responded: otp_rules::RespondedSet = Arc::new(std::sync::Mutex::new(HashSet::new()));
-
-    // Initial blocking sync — processes OTPs for any enhanced transactions directly
+    // Initial blocking sync
     println!("=== INITIAL SYNC ===");
     println!("Syncing wallet to chain tip...");
-    sync::sync_wallet(
-        &mut client,
-        &mut wallet,
-        Some(&ufvk),
-        Some(&otp_secret_bytes),
-        Some(&responded),
-    )
-    .await?;
+    let initial_requests =
+        sync::sync_wallet(&mut client, &mut wallet, Some(&ufvk)).await?;
+
+    // Process any OTP requests found during initial sync
+    let mut responded: HashSet<TxId> = HashSet::new();
+    for request in &initial_requests {
+        if responded.insert(request.request_txid) {
+            otp_rules::send_otp_response(request, &otp_secret_bytes, &mut wallet, &mut client)
+                .await;
+        }
+    }
 
     let synced_height = wallet.get_synced_height().unwrap_or(0);
     println!("Synced to block: {}", synced_height);
@@ -146,42 +148,84 @@ async fn main() -> Result<()> {
     println!("Press Ctrl+C to stop");
     println!();
 
-    // Wrap wallet for shared access between tasks
-    let wallet = Arc::new(tokio::sync::Mutex::new(wallet));
+    // Channel: mempool detects requests, main loop processes them
+    let (send_tx, mut recv_rx) = tokio::sync::mpsc::channel(64);
 
-    // Spawn two tasks: sync + mempool
-    let sync_handle = tokio::spawn(sync::run_sync_loop(
+    // Spawn mempool (no wallet — just UFVK decryption + channel send)
+    tokio::spawn(mempool::run_mempool_loop(
         client.clone(),
-        wallet.clone(),
-        SYNC_INTERVAL_SECS,
         ufvk.clone(),
-        otp_secret_bytes.clone(),
-        responded.clone(),
+        send_tx,
     ));
 
-    let mempool_handle = tokio::spawn(mempool::run_mempool_loop(
-        client,
-        wallet.clone(),
-        ufvk,
-        otp_secret_bytes,
-        responded,
-    ));
+    // Main loop: owns the wallet exclusively, no Arc<Mutex>
+    let mut last_synced_height = synced_height;
+    let mut interval = tokio::time::interval(Duration::from_secs(SYNC_INTERVAL_SECS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Wait for shutdown signal or task failure
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nShutting down...");
-        }
-        result = sync_handle => {
-            match result {
-                Ok(_) => unreachable!("sync loop never returns"),
-                Err(e) => eprintln!("Sync task panicked: {}", e),
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nShutting down...");
+                break;
             }
-        }
-        result = mempool_handle => {
-            match result {
-                Ok(_) => unreachable!("mempool loop never returns"),
-                Err(e) => eprintln!("Mempool task panicked: {}", e),
+            _ = interval.tick() => {
+                // Check chain height
+                let chain_height = match client.get_latest_block(ChainSpec {}).await {
+                    Ok(resp) => resp.into_inner().height as u32,
+                    Err(e) => {
+                        error!("Failed to get chain height: {}", e);
+                        continue;
+                    }
+                };
+
+                if chain_height <= last_synced_height {
+                    continue;
+                }
+
+                info!(
+                    "Chain at {}, last sync at {} (+{} blocks). Syncing...",
+                    chain_height, last_synced_height, chain_height - last_synced_height
+                );
+
+                match sync::sync_wallet(&mut client, &mut wallet, Some(&ufvk)).await {
+                    Ok(requests) => {
+                        last_synced_height = chain_height;
+                        for request in &requests {
+                            if responded.insert(request.request_txid) {
+                                otp_rules::send_otp_response(
+                                    request, &otp_secret_bytes, &mut wallet, &mut client,
+                                ).await;
+                            }
+                        }
+                        match wallet.get_balance() {
+                            Ok(b) => info!(
+                                "Sync @ {}. Balance: {} spendable (S={}, O={})",
+                                chain_height,
+                                u64::from(b.spendable),
+                                u64::from(b.sapling_spendable),
+                                u64::from(b.orchard_spendable)
+                            ),
+                            Err(_) => info!("Sync @ {}", chain_height),
+                        }
+                    }
+                    Err(e) => error!("Sync failed: {}", e),
+                }
+            }
+            request = recv_rx.recv() => {
+                match request {
+                    Some(request) => {
+                        if responded.insert(request.request_txid) {
+                            otp_rules::send_otp_response(
+                                &request, &otp_secret_bytes, &mut wallet, &mut client,
+                            ).await;
+                        }
+                    }
+                    None => {
+                        error!("Mempool channel closed");
+                        break;
+                    }
+                }
             }
         }
     }

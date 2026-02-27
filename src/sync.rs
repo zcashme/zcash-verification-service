@@ -2,14 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tonic::transport::Channel;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 use zcash_client_backend::{
     data_api::{
@@ -21,7 +19,7 @@ use zcash_client_backend::{
     proto::{
         compact_formats::CompactBlock,
         service::{
-            compact_tx_streamer_client::CompactTxStreamerClient, BlockId, ChainSpec, TxFilter,
+            compact_tx_streamer_client::CompactTxStreamerClient, BlockId, TxFilter,
         },
     },
 };
@@ -30,7 +28,6 @@ use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BlockHeight, BranchId, MainNetwork};
 
 use crate::memo_rules::VerificationRequest;
-use crate::otp_rules::{self, RespondedSet};
 use crate::wallet::{self, Wallet};
 
 // =============================================================================
@@ -177,9 +174,7 @@ pub async fn sync_wallet(
     client: &mut CompactTxStreamerClient<Channel>,
     wallet: &mut Wallet,
     ufvk: Option<&UnifiedFullViewingKey>,
-    otp_secret: Option<&[u8]>,
-    responded: Option<&RespondedSet>,
-) -> Result<()> {
+) -> Result<Vec<VerificationRequest>> {
     let db_cache = MemBlockCache::new();
 
     info!("Starting wallet sync...");
@@ -202,6 +197,7 @@ pub async fn sync_wallet(
         .transaction_data_requests()
         .map_err(|e| anyhow!("Failed to get transaction data requests: {:?}", e))?;
 
+    let mut otp_requests = Vec::new();
     let mut enhanced_count = 0;
     for request in requests {
         if let TransactionDataRequest::Enhancement(txid) = request {
@@ -245,23 +241,15 @@ pub async fn sync_wallet(
                 .map_err(|e| anyhow!("Failed to decrypt and store transaction: {:?}", e))?;
 
             // Check if this enhanced transaction is a verification request
-            if let (Some(ufvk), Some(otp_secret), Some(responded)) = (ufvk, otp_secret, responded)
-            {
+            if let Some(ufvk) = ufvk {
                 let height = mined_height.unwrap_or(BlockHeight::from_u32(2_600_000));
                 if let Some(decrypted) = wallet::decrypt_memo_with_ufvk(ufvk, &tx, height) {
-                    let already_responded =
-                        responded.lock().unwrap().contains(&decrypted.txid);
-                    if !already_responded {
-                        if let Some(request) = VerificationRequest::from_memo(
-                            &decrypted.memo,
-                            decrypted.txid,
-                            decrypted.value,
-                        ) {
-                            otp_rules::send_otp_response(
-                                &request, otp_secret, wallet, client, responded,
-                            )
-                            .await;
-                        }
+                    if let Some(request) = VerificationRequest::from_memo(
+                        &decrypted.memo,
+                        decrypted.txid,
+                        decrypted.value,
+                    ) {
+                        otp_requests.push(request);
                     }
                 }
             }
@@ -277,70 +265,6 @@ pub async fn sync_wallet(
         );
     }
 
-    Ok(())
+    Ok(otp_requests)
 }
 
-/// Background sync loop. Runs forever, syncing the wallet periodically.
-///
-/// Checks chain height, and syncs when new blocks are available.
-/// Logs errors and continues — never returns under normal operation.
-pub async fn run_sync_loop(
-    mut client: CompactTxStreamerClient<Channel>,
-    wallet: Arc<tokio::sync::Mutex<Wallet>>,
-    sync_interval_secs: u64,
-    ufvk: UnifiedFullViewingKey,
-    otp_secret: Vec<u8>,
-    responded: RespondedSet,
-) -> ! {
-    let mut last_synced_height: u32 = {
-        let w = wallet.lock().await;
-        w.get_synced_height().unwrap_or(0)
-    };
-
-    let mut interval = tokio::time::interval(Duration::from_secs(sync_interval_secs));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        interval.tick().await;
-
-        // Check chain height
-        let chain_height = match client.get_latest_block(ChainSpec {}).await {
-            Ok(resp) => resp.into_inner().height as u32,
-            Err(e) => {
-                error!("Failed to get chain height: {}", e);
-                continue;
-            }
-        };
-
-        if chain_height <= last_synced_height {
-            continue;
-        }
-
-        info!(
-            "Chain at {}, last sync at {} (+{} blocks). Syncing...",
-            chain_height,
-            last_synced_height,
-            chain_height - last_synced_height
-        );
-
-        let mut w = wallet.lock().await;
-        match sync_wallet(&mut client, &mut w, Some(&ufvk), Some(otp_secret.as_slice()), Some(&responded)).await {
-            Ok(()) => {
-                last_synced_height = chain_height;
-                match w.get_balance() {
-                    Ok(b) => info!(
-                        "Sync complete @ {}. Balance: {} spendable (S={}, O={})",
-                        chain_height,
-                        u64::from(b.spendable),
-                        u64::from(b.sapling_spendable),
-                        u64::from(b.orchard_spendable)
-                    ),
-                    Err(_) => info!("Sync complete @ {}", chain_height),
-                }
-            }
-            Err(e) => {
-                error!("Background sync failed: {}", e);
-            }
-        }
-    }
-}

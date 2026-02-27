@@ -1,8 +1,6 @@
 //! OTP generation, transaction request creation, and OTP response sending.
 
-use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
@@ -15,7 +13,6 @@ use zcash_client_backend::proto::service::{
     compact_tx_streamer_client::CompactTxStreamerClient, RawTransaction,
 };
 use zcash_client_backend::zip321::{Payment, TransactionRequest};
-use zcash_primitives::transaction::TxId;
 use zcash_protocol::memo::{Memo, MemoBytes};
 use zcash_protocol::value::Zatoshis;
 
@@ -82,18 +79,14 @@ pub fn create_otp_transaction_request(params: &OtpResponseParams) -> Result<Tran
 // OTP Response Sending
 // =============================================================================
 
-/// In-memory set of request txids we've already responded to.
-pub type RespondedSet = Arc<std::sync::Mutex<HashSet<TxId>>>;
-
-/// Generate OTP, create transaction, broadcast, and mark responded.
+/// Generate OTP, create transaction, and broadcast.
 ///
-/// Called by both mempool and sync paths. Callers handle their own locking.
+/// Called by the main loop which handles deduplication.
 pub async fn send_otp_response(
     request: &VerificationRequest,
     otp_secret: &[u8],
     wallet: &mut Wallet,
     client: &mut CompactTxStreamerClient<Channel>,
-    responded: &RespondedSet,
 ) {
     let txid_hex = hex::encode(request.request_txid.as_ref());
 
@@ -163,6 +156,4 @@ pub async fn send_otp_response(
         }
     }
 
-    // Mark responded regardless — tx was created, retrying would double-spend
-    responded.lock().unwrap().insert(request.request_txid);
 }
