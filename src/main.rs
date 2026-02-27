@@ -1,7 +1,6 @@
 //! ZVS - Zcash Verification Service
 
-use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -28,30 +27,41 @@ use wallet::Wallet;
 const SYNC_INTERVAL_SECS: u64 = 30;
 
 // =============================================================================
-// Seed Loading
+// Keys Loading
 // =============================================================================
 
-/// Load wallet seed from MNEMONIC environment variable.
-///
-/// Returns the full 64-byte BIP39-derived seed for key derivation.
-fn load_seed() -> Result<Vec<u8>> {
-    let mnemonic_str = env::var("MNEMONIC")
-        .map_err(|_| anyhow!("MNEMONIC environment variable required (24-word BIP39 phrase)"))?;
+#[derive(serde::Deserialize)]
+struct Keys {
+    mnemonic: String,
+    otp_secret: String,
+    birthday_height: u32,
+}
 
-    let mnemonic: Mnemonic<English> = mnemonic_str
+/// Load secrets and config from `keys.toml` in the data directory.
+///
+/// Returns (seed, otp_secret_bytes, birthday_height).
+fn load_keys(data_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, u32)> {
+    let path = data_dir.join("keys.toml");
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|_| anyhow!("keys.toml not found at {}", path.display()))?;
+    let keys: Keys =
+        toml::from_str(&contents).map_err(|e| anyhow!("Invalid keys.toml: {e}"))?;
+
+    let mnemonic: Mnemonic<English> = keys
+        .mnemonic
         .trim()
         .parse()
-        .map_err(|e| anyhow!("Invalid mnemonic: {}", e))?;
-
-    let passphrase = env::var("MNEMONIC_PASSPHRASE").unwrap_or_default();
-    let seed = mnemonic.to_seed(&passphrase);
+        .map_err(|e| anyhow!("Invalid mnemonic: {e}"))?;
+    let seed = mnemonic.to_seed("").to_vec();
+    let otp_secret =
+        hex::decode(&keys.otp_secret).map_err(|e| anyhow!("Invalid otp_secret hex: {e}"))?;
 
     info!(
-        "Loaded seed from MNEMONIC ({} words)",
-        mnemonic_str.split_whitespace().count()
+        "Loaded keys from {}",
+        path.display()
     );
 
-    Ok(seed.to_vec())
+    Ok((seed, otp_secret, keys.birthday_height))
 }
 
 // =============================================================================
@@ -64,23 +74,13 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    dotenvy::dotenv().ok();
-
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let url = env::var("LIGHTWALLETD_URL").expect("LIGHTWALLETD_URL required");
-    let birthday_height: u32 = env::var("BIRTHDAY_HEIGHT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let data_dir = env::var("ZVS_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./zvs_data"));
-    let otp_secret = env::var("OTP_SECRET").expect("OTP_SECRET required");
+    let url = "https://zec.rocks:443";
+    let data_dir = PathBuf::from("./zvs_data");
 
-    let seed = load_seed()?;
-    let otp_secret_bytes = hex::decode(&otp_secret)?;
+    let (seed, otp_secret_bytes, birthday_height) = load_keys(&data_dir)?;
 
     println!("ZVS - Zcash Verification Service");
     println!("=================================");
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
 
     // Single gRPC connection — cheap to clone for each task
     info!("Connecting to lightwalletd at {}", url);
-    let mut client = CompactTxStreamerClient::connect(url.clone()).await?;
+    let mut client = CompactTxStreamerClient::connect(url).await?;
 
     // Fetch birthday for wallet initialization (only needed if wallet.db doesn't exist)
     let birthday = sync::fetch_birthday(&mut client, birthday_height).await?;

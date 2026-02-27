@@ -2,8 +2,7 @@
 /target
 Cargo.lock
 
-# Environment and secrets
-.env
+# Secrets
 seed.txt
 
 # Data directories

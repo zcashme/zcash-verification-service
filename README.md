@@ -41,31 +41,21 @@ A two-factor authentication (2FA) service using shielded Zcash transactions. Use
 
 ## Configuration
 
-ZVS is configured via environment variables. Create a `.env` file:
+ZVS reads secrets from `zvs_data/keys.toml`:
 
-```env
-# Required
-LIGHTWALLETD_URL=https://mainnet.lightwalletd.com:9067
-MNEMONIC=<your-24-word-BIP39-mnemonic>
-OTP_SECRET=<your-otp-secret-in-hex>
-
-# Optional
-BIRTHDAY_HEIGHT=1               # Wallet birthday height (default: 1)
-ZVS_DATA_DIR=./zvs_data         # Data directory (default: ./zvs_data)
-MNEMONIC_PASSPHRASE=             # BIP39 passphrase (default: empty)
-RUST_LOG=info                    # Log level (default: info)
+```toml
+mnemonic = "word1 word2 ... word24"
+otp_secret = "a71440d829e0403019d195a78afd89efe4c18a4e"
+birthday_height = 3150000
 ```
 
-### Environment Variables
+| Field | Description |
+|-------|-------------|
+| `mnemonic` | 24-word BIP39 mnemonic phrase |
+| `otp_secret` | Secret key for HMAC-based OTP generation (hex-encoded) |
+| `birthday_height` | Block height when the wallet was created |
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `LIGHTWALLETD_URL` | Yes | gRPC URL of the lightwalletd server |
-| `MNEMONIC` | Yes | 24-word BIP39 mnemonic phrase |
-| `OTP_SECRET` | Yes | Secret key for HMAC-based OTP generation (hex-encoded) |
-| `BIRTHDAY_HEIGHT` | No | Block height when the wallet was created (default: 1) |
-| `ZVS_DATA_DIR` | No | Directory for wallet database (default: `./zvs_data`) |
-| `MNEMONIC_PASSPHRASE` | No | BIP39 passphrase for seed derivation (default: empty) |
+Set `RUST_LOG=debug` to increase log verbosity (default: `info`).
 
 ## Building
 
@@ -110,7 +100,7 @@ Two concurrent tasks share the wallet via `Arc<Mutex>`:
 
 ```
 src/
-├── main.rs       # Entry point, env config, task spawning
+├── main.rs       # Entry point, keys.toml config, task spawning
 ├── wallet.rs     # Local wallet operations (keys, DB, proving, signing)
 ├── sync.rs       # Block sync with lightwalletd, in-memory block cache
 ├── mempool.rs    # Real-time mempool streaming and processing

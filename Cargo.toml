@@ -35,7 +35,8 @@ rusqlite = "0.37"
 # Utils
 anyhow = "1"
 rand = "0.8"
-dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
