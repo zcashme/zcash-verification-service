@@ -1,12 +1,9 @@
-//! Shared OTP send logic and persistent processed store.
+//! Shared OTP send logic.
 //!
 //! Both mempool and sync call `send_otp_response()` directly inline.
-//! ProcessedStore prevents duplicate OTPs across restarts.
+//! `RespondedSet` prevents duplicate OTPs within a single run.
 
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tonic::transport::Channel;
@@ -21,76 +18,14 @@ use crate::memo_rules::VerificationRequest;
 use crate::otp_rules;
 use crate::wallet::Wallet;
 
-// =============================================================================
-// Processed Store (persistent across restarts)
-// =============================================================================
-
-/// Tracks which verification request txids have been successfully processed.
-/// Persists to disk so we don't re-send OTPs after restart.
-pub struct ProcessedStore {
-    path: PathBuf,
-    txids: HashSet<TxId>,
-}
-
-impl ProcessedStore {
-    /// Load from file. Creates empty store if file doesn't exist.
-    pub fn load(path: PathBuf) -> Self {
-        let mut txids = HashSet::new();
-
-        if path.exists() {
-            if let Ok(file) = fs::File::open(&path) {
-                let reader = BufReader::new(file);
-                for line in reader.lines() {
-                    if let Ok(hex_str) = line {
-                        let hex_str = hex_str.trim();
-                        if hex_str.is_empty() {
-                            continue;
-                        }
-                        if let Ok(bytes) = hex::decode(hex_str) {
-                            if bytes.len() == 32 {
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(&bytes);
-                                txids.insert(TxId::from_bytes(arr));
-                            }
-                        }
-                    }
-                }
-                info!(
-                    "Loaded {} processed OTP txids from {}",
-                    txids.len(),
-                    path.display()
-                );
-            }
-        }
-
-        Self { path, txids }
-    }
-
-    /// Mark a txid as processed and persist to disk.
-    pub fn mark_processed(&mut self, txid: TxId) {
-        if self.txids.insert(txid) {
-            // Append to file
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-            {
-                let _ = writeln!(file, "{}", hex::encode(txid.as_ref()));
-            }
-        }
-    }
-
-    /// Check if a txid has already been processed.
-    pub fn is_processed(&self, txid: &TxId) -> bool {
-        self.txids.contains(txid)
-    }
-}
+/// In-memory set of request txids we've already responded to.
+pub type RespondedSet = Arc<std::sync::Mutex<HashSet<TxId>>>;
 
 // =============================================================================
 // Shared OTP Send
 // =============================================================================
 
-/// Generate OTP, create transaction, broadcast, and mark processed.
+/// Generate OTP, create transaction, broadcast, and mark responded.
 ///
 /// Called by both mempool and sync paths. Callers handle their own locking.
 pub async fn send_otp_response(
@@ -98,7 +33,7 @@ pub async fn send_otp_response(
     otp_secret: &[u8],
     wallet: &mut Wallet,
     client: &mut CompactTxStreamerClient<Channel>,
-    processed: &Arc<std::sync::Mutex<ProcessedStore>>,
+    responded: &RespondedSet,
 ) {
     let txid_hex = hex::encode(request.request_txid.as_ref());
 
@@ -168,6 +103,6 @@ pub async fn send_otp_response(
         }
     }
 
-    // Mark processed regardless — tx was created, retrying would double-spend
-    processed.lock().unwrap().mark_processed(request.request_txid);
+    // Mark responded regardless — tx was created, retrying would double-spend
+    responded.lock().unwrap().insert(request.request_txid);
 }

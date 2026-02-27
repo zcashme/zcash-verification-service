@@ -88,13 +88,13 @@ Two concurrent tasks share the wallet via `Arc<Mutex>`:
 │ • Validates requests    │◄────────────────────────►│ • Catches missed txs    │
 │ • Sends OTP inline      │                          │ • Sends OTP inline      │
 └─────────────────────────┘                          └─────────────────────────┘
-                              ProcessedStore
-                          (dedup across restarts)
+                              RespondedSet
+                        (in-memory dedup via HashSet)
 ```
 
 - **Mempool Monitor**: Streams unconfirmed transactions in real-time, decrypts memos with the UFVK, and sends OTP responses immediately.
 - **Background Sync**: Periodically syncs the wallet to chain tip (every 30s), processes any verification requests discovered during block scanning.
-- **ProcessedStore**: Persistent deduplication — prevents re-sending OTPs after restarts by tracking processed txids on disk.
+- **RespondedSet**: In-memory `HashSet<TxId>` shared between both tasks — prevents duplicate OTPs within a single run.
 
 ### Source Files
 
@@ -106,7 +106,7 @@ src/
 ├── mempool.rs    # Real-time mempool streaming and processing
 ├── memo_rules.rs # Memo format validation and parsing
 ├── otp_rules.rs  # HMAC-based OTP generation and transaction requests
-└── otp_send.rs   # Shared OTP send logic and processed store
+└── otp_send.rs   # Shared OTP send logic and RespondedSet type
 ```
 
 ### Core Components
@@ -115,7 +115,7 @@ src/
 - **`MemBlockCache`** - In-memory cache for compact blocks during sync
 - **`DecryptedMemo`** - Decrypted memo with txid and value from a received transaction
 - **`VerificationRequest`** - Validated request ready for OTP generation
-- **`ProcessedStore`** - Persistent txid tracker to prevent duplicate OTPs
+- **`RespondedSet`** - In-memory txid set to prevent duplicate OTPs within a run
 
 ### Response Format
 
@@ -213,7 +213,7 @@ function hexToBytes(hex) {
 
 - **Shielded transactions** - All communication uses Zcash shielded pools (Sapling/Orchard)
 - **HMAC-SHA256** - OTPs are derived deterministically from session IDs
-- **Processed store** - Persistent deduplication prevents re-sending OTPs after restarts
+- **In-memory dedup** - Shared `HashSet` prevents re-sending OTPs within a single run
 
 ## Dependencies
 

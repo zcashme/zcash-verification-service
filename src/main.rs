@@ -1,5 +1,6 @@
 //! ZVS - Zcash Verification Service
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,7 +17,6 @@ mod otp_send;
 mod sync;
 mod wallet;
 
-use otp_send::ProcessedStore;
 use wallet::Wallet;
 
 // =============================================================================
@@ -37,15 +37,12 @@ struct Keys {
     birthday_height: u32,
 }
 
-/// Load secrets and config from `keys.toml` in the data directory.
-///
 /// Returns (seed, otp_secret_bytes, birthday_height).
 fn load_keys(data_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, u32)> {
     let path = data_dir.join("keys.toml");
     let contents = std::fs::read_to_string(&path)
         .map_err(|_| anyhow!("keys.toml not found at {}", path.display()))?;
-    let keys: Keys =
-        toml::from_str(&contents).map_err(|e| anyhow!("Invalid keys.toml: {e}"))?;
+    let keys: Keys = toml::from_str(&contents).map_err(|e| anyhow!("Invalid keys.toml: {e}"))?;
 
     let mnemonic: Mnemonic<English> = keys
         .mnemonic
@@ -56,10 +53,7 @@ fn load_keys(data_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, u32)> {
     let otp_secret =
         hex::decode(&keys.otp_secret).map_err(|e| anyhow!("Invalid otp_secret hex: {e}"))?;
 
-    info!(
-        "Loaded keys from {}",
-        path.display()
-    );
+    info!("Loaded keys from {}", path.display());
 
     Ok((seed, otp_secret, keys.birthday_height))
 }
@@ -108,10 +102,8 @@ async fn main() -> Result<()> {
     // Clone UFVK before wrapping wallet in Arc<Mutex>
     let ufvk = wallet.get_ufvk();
 
-    // Initialize processed store
-    let processed_store = Arc::new(std::sync::Mutex::new(ProcessedStore::load(
-        data_dir.join("processed_otps.log"),
-    )));
+    // In-memory set of responded request txids (not persisted across restarts)
+    let responded: otp_send::RespondedSet = Arc::new(std::sync::Mutex::new(HashSet::new()));
 
     // Initial blocking sync — processes OTPs for any enhanced transactions directly
     println!("=== INITIAL SYNC ===");
@@ -121,7 +113,7 @@ async fn main() -> Result<()> {
         &mut wallet,
         Some(&ufvk),
         Some(&otp_secret_bytes),
-        Some(&processed_store),
+        Some(&responded),
     )
     .await?;
 
@@ -165,7 +157,7 @@ async fn main() -> Result<()> {
         SYNC_INTERVAL_SECS,
         ufvk.clone(),
         otp_secret_bytes.clone(),
-        processed_store.clone(),
+        responded.clone(),
     ));
 
     let mempool_handle = tokio::spawn(mempool::run_mempool_loop(
@@ -173,7 +165,7 @@ async fn main() -> Result<()> {
         wallet.clone(),
         ufvk,
         otp_secret_bytes,
-        processed_store,
+        responded,
     ));
 
     // Wait for shutdown signal or task failure

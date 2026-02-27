@@ -18,7 +18,7 @@ use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_protocol::consensus::{BlockHeight, BranchId, MainNetwork};
 
 use crate::memo_rules::{self, VerificationRequest};
-use crate::otp_send::{self, ProcessedStore};
+use crate::otp_send::{self, RespondedSet};
 use crate::wallet::{self, Wallet};
 
 // =============================================================================
@@ -49,7 +49,7 @@ pub async fn run_mempool_loop(
     wallet: Arc<tokio::sync::Mutex<Wallet>>,
     ufvk: UnifiedFullViewingKey,
     otp_secret: Vec<u8>,
-    processed: Arc<std::sync::Mutex<ProcessedStore>>,
+    responded: RespondedSet,
 ) -> ! {
     let mut seen = ProcessedTxids::new();
 
@@ -78,7 +78,7 @@ pub async fn run_mempool_loop(
                         &mut seen,
                         &wallet,
                         &mut client,
-                        &processed,
+                        &responded,
                     )
                     .await;
                 }
@@ -111,7 +111,7 @@ async fn process_mempool_tx(
     seen: &mut ProcessedTxids,
     wallet: &Arc<tokio::sync::Mutex<Wallet>>,
     client: &mut CompactTxStreamerClient<Channel>,
-    processed: &Arc<std::sync::Mutex<ProcessedStore>>,
+    responded: &RespondedSet,
 ) {
     // Parse transaction
     let height = if height == 0 {
@@ -177,16 +177,13 @@ async fn process_mempool_tx(
             }
         };
 
-    // Check persistent processed store — skip if already sent
-    {
-        let ps = processed.lock().unwrap();
-        if ps.is_processed(&request.request_txid) {
-            return;
-        }
+    // Check responded set — skip if already sent
+    if responded.lock().unwrap().contains(&request.request_txid) {
+        return;
     }
 
-    // Lock wallet, send OTP response, then mark processed
+    // Lock wallet, send OTP response, then mark responded
     // Note: we don't hold the std::sync::Mutex across the await
     let mut w = wallet.lock().await;
-    otp_send::send_otp_response(&request, otp_secret, &mut w, client, processed).await;
+    otp_send::send_otp_response(&request, otp_secret, &mut w, client, responded).await;
 }
