@@ -1,8 +1,7 @@
-//! Mempool monitoring — the hot path.
+//! Mempool monitoring — producer for the OTP queue.
 //!
 //! Streams mempool transactions, decrypts memos, validates verification
-//! requests, deduplicates, creates OTP response transactions, and broadcasts.
-//! The wallet lock is only held briefly for `create_transaction`.
+//! requests, deduplicates, and enqueues valid requests for the OTP consumer.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -12,15 +11,15 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
 use zcash_client_backend::proto::service::{
-    compact_tx_streamer_client::CompactTxStreamerClient, Empty, RawTransaction,
+    compact_tx_streamer_client::CompactTxStreamerClient, Empty,
 };
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_protocol::consensus::{BlockHeight, BranchId, MainNetwork};
 
 use crate::memo_rules::{self, VerificationRequest};
-use crate::otp_rules;
-use crate::wallet::{self, Wallet};
+use crate::otp_queue::OtpQueue;
+use crate::wallet;
 
 // =============================================================================
 // Deduplication
@@ -47,9 +46,8 @@ impl ProcessedTxids {
 /// Run the mempool monitoring loop. Never returns under normal operation.
 pub async fn run_mempool_loop(
     mut client: CompactTxStreamerClient<Channel>,
-    wallet: Arc<tokio::sync::Mutex<Wallet>>,
+    queue: Arc<OtpQueue>,
     ufvk: UnifiedFullViewingKey,
-    otp_secret: Vec<u8>,
 ) -> ! {
     let mut processed = ProcessedTxids::new();
 
@@ -74,12 +72,9 @@ pub async fn run_mempool_loop(
                         &raw_tx.data,
                         raw_tx.height as u32,
                         &ufvk,
-                        &otp_secret,
                         &mut processed,
-                        &wallet,
-                        &mut client,
-                    )
-                    .await;
+                        &queue,
+                    );
                 }
                 Ok(None) => {
                     // Stream closed (new block mined)
@@ -101,18 +96,16 @@ pub async fn run_mempool_loop(
 
 /// Process a single mempool transaction.
 ///
-/// All steps before `create_transaction` run without the wallet lock:
-/// parsing, decryption, validation, dedup, OTP generation.
-async fn process_mempool_tx(
+/// Parses, decrypts, validates, and enqueues valid verification requests.
+/// No wallet lock or network I/O needed.
+fn process_mempool_tx(
     tx_data: &[u8],
     height: u32,
     ufvk: &UnifiedFullViewingKey,
-    otp_secret: &[u8],
     processed: &mut ProcessedTxids,
-    wallet: &Arc<tokio::sync::Mutex<Wallet>>,
-    client: &mut CompactTxStreamerClient<Channel>,
+    queue: &Arc<OtpQueue>,
 ) {
-    // Parse transaction — no lock needed
+    // Parse transaction
     let height = if height == 0 {
         BlockHeight::from_u32(2_600_000) // Mempool txs use recent height for branch ID
     } else {
@@ -131,13 +124,13 @@ async fn process_mempool_tx(
     let txid = tx.txid();
     debug!("Received mempool tx: {}", hex::encode(txid.as_ref()));
 
-    // Decrypt memo using UFVK — no lock needed
+    // Decrypt memo using UFVK
     let decrypted = match wallet::decrypt_memo_with_ufvk(ufvk, &tx, height) {
         Some(d) => d,
         None => return, // Not for us
     };
 
-    // Check dedup — no lock needed
+    // Check dedup
     if !processed.is_new(decrypted.txid) {
         info!(
             "Skipping duplicate tx: {}",
@@ -146,7 +139,7 @@ async fn process_mempool_tx(
         return;
     }
 
-    // Create verification request (validates memo format and payment) — no lock needed
+    // Create verification request (validates memo format and payment)
     let request =
         match VerificationRequest::from_memo(&decrypted.memo, decrypted.txid, decrypted.value) {
             Some(r) => r,
@@ -176,73 +169,9 @@ async fn process_mempool_tx(
             }
         };
 
-    // Generate OTP — no lock needed
+    // Enqueue for the OTP consumer
     let txid_hex = hex::encode(request.request_txid.as_ref());
-    let otp = otp_rules::generate_otp(otp_secret, &request.session_id);
-
-    info!("=== VERIFICATION REQUEST ===");
-    info!("Session: {}", request.session_id);
-    info!("Payment: {} zats", u64::from(request.value));
-    info!("Request tx: {}", txid_hex);
-    info!("Generated OTP: {}", otp);
-    info!("Reply to: {}", request.user_address);
-    info!("============================");
-
-    // Build transaction request — no lock needed
-    let params = otp_rules::OtpResponseParams {
-        recipient_address: request.user_address.clone(),
-        otp_code: otp,
-        request_txid_hex: txid_hex.clone(),
-    };
-
-    let tx_request = match otp_rules::create_otp_transaction_request(&params) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to create transaction request: {}", e);
-            return;
-        }
-    };
-
-    // Create transaction — lock wallet briefly for proving + signing
-    let raw_tx_bytes = {
-        let mut w = wallet.lock().await;
-        match w.create_transaction(tx_request) {
-            Ok((response_txid, bytes)) => {
-                info!(
-                    "Transaction created: {} (reply to {})",
-                    hex::encode(response_txid.as_ref()),
-                    txid_hex
-                );
-                bytes
-            }
-            Err(e) => {
-                error!("Failed to create OTP response transaction: {}", e);
-                return;
-            }
-        }
-    }; // lock released
-
-    // Broadcast — no lock needed
-    match client
-        .send_transaction(RawTransaction {
-            data: raw_tx_bytes,
-            height: 0,
-        })
-        .await
-    {
-        Ok(response) => {
-            let send_response = response.into_inner();
-            if send_response.error_code != 0 {
-                error!(
-                    "Broadcast rejected: {} (reply to {})",
-                    send_response.error_message, txid_hex
-                );
-            } else {
-                info!("OTP response broadcast (reply to {})", txid_hex);
-            }
-        }
-        Err(e) => {
-            error!("Broadcast failed: {} (reply to {})", e, txid_hex);
-        }
+    if queue.insert(request) {
+        info!("Enqueued verification request (tx={})", txid_hex);
     }
 }

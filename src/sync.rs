@@ -20,13 +20,18 @@ use zcash_client_backend::{
     },
     proto::{
         compact_formats::CompactBlock,
-        service::{compact_tx_streamer_client::CompactTxStreamerClient, BlockId, ChainSpec, TxFilter},
+        service::{
+            compact_tx_streamer_client::CompactTxStreamerClient, BlockId, ChainSpec, TxFilter,
+        },
     },
 };
+use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BlockHeight, BranchId, MainNetwork};
 
-use crate::wallet::Wallet;
+use crate::memo_rules::VerificationRequest;
+use crate::otp_queue::{OtpQueue, ProcessedStore};
+use crate::wallet::{self, Wallet};
 
 // =============================================================================
 // MemBlockCache - In-memory block cache for sync
@@ -168,12 +173,12 @@ pub async fn fetch_birthday(
 ///
 /// Downloads compact blocks, scans for relevant transactions, and enhances
 /// discovered transactions by fetching full tx data and decrypting memos.
-///
-/// Extracted from the former `Wallet::sync()` method so that all network I/O
-/// lives outside `wallet.rs`.
 pub async fn sync_wallet(
     client: &mut CompactTxStreamerClient<Channel>,
     wallet: &mut Wallet,
+    ufvk: Option<&UnifiedFullViewingKey>,
+    queue: Option<&Arc<OtpQueue>>,
+    processed: Option<&Arc<std::sync::Mutex<ProcessedStore>>>,
 ) -> Result<()> {
     let db_cache = MemBlockCache::new();
 
@@ -239,6 +244,28 @@ pub async fn sync_wallet(
             decrypt_and_store_transaction(&MainNetwork, wallet.db_mut(), &tx, mined_height)
                 .map_err(|e| anyhow!("Failed to decrypt and store transaction: {:?}", e))?;
 
+            // Check if this enhanced transaction is a verification request
+            if let (Some(ufvk), Some(queue), Some(processed)) = (ufvk, queue, processed) {
+                let height = mined_height.unwrap_or(BlockHeight::from_u32(2_600_000));
+                if let Some(decrypted) = wallet::decrypt_memo_with_ufvk(ufvk, &tx, height) {
+                    let is_processed = processed.lock().unwrap().is_processed(&decrypted.txid);
+                    if !is_processed {
+                        if let Some(request) = VerificationRequest::from_memo(
+                            &decrypted.memo,
+                            decrypted.txid,
+                            decrypted.value,
+                        ) {
+                            if queue.insert(request) {
+                                info!(
+                                    "Enqueued verification request from block sync (tx={})",
+                                    hex::encode(decrypted.txid.as_ref())
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             enhanced_count += 1;
         }
     }
@@ -261,6 +288,9 @@ pub async fn run_sync_loop(
     mut client: CompactTxStreamerClient<Channel>,
     wallet: Arc<tokio::sync::Mutex<Wallet>>,
     sync_interval_secs: u64,
+    ufvk: UnifiedFullViewingKey,
+    queue: Arc<OtpQueue>,
+    processed: Arc<std::sync::Mutex<ProcessedStore>>,
 ) -> ! {
     let mut last_synced_height: u32 = {
         let w = wallet.lock().await;
@@ -294,7 +324,7 @@ pub async fn run_sync_loop(
         );
 
         let mut w = wallet.lock().await;
-        match sync_wallet(&mut client, &mut w).await {
+        match sync_wallet(&mut client, &mut w, Some(&ufvk), Some(&queue), Some(&processed)).await {
             Ok(()) => {
                 last_synced_height = chain_height;
                 match w.get_balance() {

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use secrecy::Secret;
@@ -97,6 +97,7 @@ pub struct Wallet {
     account_id: AccountUuid,
     usk: UnifiedSpendingKey,
     prover: LocalTxProver,
+    data_dir: PathBuf,
 }
 
 impl Wallet {
@@ -145,6 +146,7 @@ impl Wallet {
             account_id,
             usk,
             prover,
+            data_dir: data_dir.to_path_buf(),
         })
     }
 
@@ -163,6 +165,11 @@ impl Wallet {
     /// Read-only reference to the wallet database.
     pub fn db(&self) -> &WalletDbType {
         &self.db
+    }
+
+    /// Path to the data directory.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     // =========================================================================
