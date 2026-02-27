@@ -18,7 +18,7 @@ use zcash_primitives::transaction::{Transaction, TxId};
 use zcash_protocol::consensus::{BlockHeight, BranchId, MainNetwork};
 
 use crate::memo_rules::{self, VerificationRequest};
-use crate::otp_send::{self, RespondedSet};
+use crate::otp_rules::{self, RespondedSet};
 use crate::wallet::{self, Wallet};
 
 // =============================================================================
@@ -185,5 +185,5 @@ async fn process_mempool_tx(
     // Lock wallet, send OTP response, then mark responded
     // Note: we don't hold the std::sync::Mutex across the await
     let mut w = wallet.lock().await;
-    otp_send::send_otp_response(&request, otp_secret, &mut w, client, responded).await;
+    otp_rules::send_otp_response(&request, otp_secret, &mut w, client, responded).await;
 }

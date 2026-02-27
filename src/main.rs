@@ -13,7 +13,6 @@ use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxS
 mod memo_rules;
 mod mempool;
 mod otp_rules;
-mod otp_send;
 mod sync;
 mod wallet;
 
@@ -103,7 +102,7 @@ async fn main() -> Result<()> {
     let ufvk = wallet.get_ufvk();
 
     // In-memory set of responded request txids (not persisted across restarts)
-    let responded: otp_send::RespondedSet = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let responded: otp_rules::RespondedSet = Arc::new(std::sync::Mutex::new(HashSet::new()));
 
     // Initial blocking sync — processes OTPs for any enhanced transactions directly
     println!("=== INITIAL SYNC ===");

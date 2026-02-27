@@ -30,7 +30,7 @@ use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BlockHeight, BranchId, MainNetwork};
 
 use crate::memo_rules::VerificationRequest;
-use crate::otp_send::{self, RespondedSet};
+use crate::otp_rules::{self, RespondedSet};
 use crate::wallet::{self, Wallet};
 
 // =============================================================================
@@ -257,7 +257,7 @@ pub async fn sync_wallet(
                             decrypted.txid,
                             decrypted.value,
                         ) {
-                            otp_send::send_otp_response(
+                            otp_rules::send_otp_response(
                                 &request, otp_secret, wallet, client, responded,
                             )
                             .await;
