@@ -24,10 +24,11 @@ pub const RESPONSE_AMOUNT: Zatoshis = Zatoshis::const_from_u64(50_000);
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Generate HMAC-based OTP from session ID and secret.
-pub fn generate_otp(secret: &[u8], session_id: &str) -> String {
+/// Generate HMAC-based OTP from session ID + user address and secret.
+pub fn generate_otp(secret: &[u8], session_id: &str, user_address: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can take key of any size");
     mac.update(session_id.as_bytes());
+    mac.update(user_address.as_bytes());
     let result = mac.finalize();
     let bytes = result.into_bytes();
     let code = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -97,7 +98,7 @@ pub async fn send_otp_response(
     info!("Request tx: {}", txid_hex);
 
     // Generate OTP
-    let otp = generate_otp(otp_secret, &request.session_id);
+    let otp = generate_otp(otp_secret, &request.session_id, &request.user_address);
     info!("Generated OTP: {}", otp);
     info!("Reply to: {}", request.user_address);
     info!("============================");
