@@ -13,13 +13,13 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 tonic = { version = "0.14", features = ["channel"] }
 
-# Core zcash dependencies - let these pull in compatible versions
-zcash_client_backend = { version = "0.21", features = ["lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots", "lightwalletd-tonic-transport", "orchard", "sync"] }
-zcash_client_sqlite = { version = "0.19", features = ["orchard"] }
-zcash_protocol = "0.7"
-zcash_proofs = { version = "0.26", features = ["bundled-prover"] }
-zcash_keys = { version = "0.12", features = ["orchard", "sapling"] }
-zcash_primitives = "0.26"
+# Core zcash dependencies - bumped to the 2026-06-03 network-upgrade release
+zcash_client_backend = { version = "0.23", features = ["lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots", "lightwalletd-tonic-transport", "orchard", "sync"] }
+zcash_client_sqlite = { version = "0.21", features = ["orchard"] }
+zcash_protocol = "0.9"
+zcash_proofs = { version = "0.28", features = ["bundled-prover"] }
+zcash_keys = { version = "0.14", features = ["orchard", "sapling"] }
+zcash_primitives = "0.28"
 zip32 = "0.2"
 secrecy = "0.8"
 
@@ -44,7 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HMAC OTP generation
 hmac = "0.12"
 sha2 = "0.10"
-zcash_address = "0.10.1"
+zcash_address = "0.12"
 
 # BIP39 mnemonic support
 bip0039 = "0.11"

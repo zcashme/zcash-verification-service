@@ -64,13 +64,13 @@ pub fn create_otp_transaction_request(params: &OtpResponseParams) -> Result<Tran
 
     let payment = Payment::new(
         recipient,
-        amount,
+        Some(amount),
         Some(memo),
         None,   // label
         None,   // message
         vec![], // other_params
     )
-    .ok_or_else(|| anyhow!("Failed to create payment"))?;
+    .map_err(|e| anyhow!("Failed to create payment: {e}"))?;
 
     TransactionRequest::new(vec![payment])
         .map_err(|e| anyhow!("Failed to create transaction request: {e}"))
