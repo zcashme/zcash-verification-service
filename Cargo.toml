@@ -1,0 +1,61 @@
+[package]
+name = "zfa-backend"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "ZFA authentication worker — watches the Zcash mempool for shielded login payments"
+
+[[bin]]
+name = "zfa-backend"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.21", features = ["rt-multi-thread", "macros", "fs", "signal", "sync", "time", "io-util"] }
+
+# gRPC (tonic comes through zcash_client_backend but we need the transport/codec types directly)
+tonic = { version = "0.14", default-features = false }
+
+# Serialization / config / logging
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4.5", features = ["derive", "string", "env"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Zcash — pinned to the ironwood/NU6.3 librustzcash line (same as zecd)
+zcash_client_backend = { version = "0.24.0-rc.1", features = ["orchard", "lightwalletd-tonic-transport"] }
+zcash_client_sqlite = { version = "0.22.0-rc.1", features = ["unstable", "orchard"] }
+zcash_keys = { version = "0.15", features = ["unstable", "orchard"] }
+zcash_primitives = "0.29"
+zcash_proofs = { version = "0.29", features = ["bundled-prover"] }
+zcash_protocol = { version = "0.10", features = ["local-consensus"] }
+orchard = { version = "0.15", default-features = false, features = ["circuit"] }
+
+# Session DB (zfa.db — separate from the wallet DB, same rusqlite version as zcash_client_sqlite)
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# OTP
+hmac = "0.12"
+sha2 = "0.10"
+
+# Seed custody / key management
+secrecy = "0.8"
+bip0039 = { version = "0.12", features = ["std", "all-languages"] }
+age = { version = "0.11", features = ["armor"] }
+zip32 = "0.2"
+
+# Utilities
+hex = "0.4"
+subtle = "2"
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+
+# Single-instance guard
+fmutex = "0.3"
+
+# Hardening (mlock, RLIMIT_CORE, PR_SET_DUMPABLE)
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
