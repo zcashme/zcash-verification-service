@@ -45,8 +45,8 @@ pub mod sync;
 pub mod wallet;
 pub mod watcher;
 
-use std::path::Path;
-use tracing::info;
+use std::time::Duration;
+use tracing::{error, info, warn};
 
 /// Run the ZFA authentication worker until graceful shutdown.
 ///
@@ -68,13 +68,45 @@ pub async fn run(config: config::AppConfig) -> anyhow::Result<()> {
     // Initialize the session database (zfa.db) — separate from the wallet DB.
     let zfa_db_path = config.datadir.join("zfa.db");
     let _zfa_db = session::init_db(&zfa_db_path)?;
-
     info!("zfa.db initialized at {}", zfa_db_path.display());
 
-    // TODO: open wallet, connect to lightwalletd, spawn actor, run until shutdown.
+    // Shutdown signal.
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
-    // For now, wait for shutdown signal.
+    // Spawn the wallet actor.
+    let wallet_dir = config.datadir.clone();
+    let keys_path = config.datadir.join("keys.toml");
+    let age_identity = config.datadir.join("identity.txt");
+
+    let actor_cfg = wallet::actor::ActorConfig {
+        network: config.network,
+        wallet_dir,
+        keys_path,
+        lwd_url: config.lwd_url.clone(),
+        session_ttl_secs: config.session_ttl_secs,
+        sync_interval: Duration::from_secs(config.sync_interval_secs),
+        connect_timeout: Duration::from_secs(10),
+        reconnect_base: Duration::from_secs(config.reconnect_base_secs),
+        reconnect_max: Duration::from_secs(config.reconnect_max_secs),
+        age_identity: if age_identity.exists() { Some(age_identity) } else { None },
+        zfa_db_path,
+        shutdown: shutdown_tx.subscribe(),
+    };
+
+    let actor_task = wallet::actor::spawn(actor_cfg).await?;
+
+    // Wait for shutdown signal.
     wait_for_shutdown().await;
+    shutdown_tx.send_replace(true);
+
+    // Wait for the actor to stop.
+    let stop_deadline = Duration::from_secs(30);
+    match tokio::time::timeout(stop_deadline, actor_task).await {
+        Ok(Ok(())) => info!("wallet actor stopped"),
+        Ok(Err(e)) => error!("wallet actor task panicked: {e}"),
+        Err(_) => warn!("wallet actor did not stop within {stop_deadline:?}; exiting anyway"),
+    }
+
     info!("shutting down");
     Ok(())
 }
