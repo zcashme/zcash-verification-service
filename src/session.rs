@@ -26,6 +26,7 @@ pub fn init_db(path: &Path) -> anyhow::Result<Connection> {
             status       TEXT NOT NULL DEFAULT 'pending',
             address      TEXT,
             txid         TEXT,
+            user_address TEXT,
             created_at   INTEGER NOT NULL,
             expires_at   INTEGER NOT NULL,
             authenticated_at INTEGER,
@@ -109,7 +110,7 @@ pub fn authenticate_session(
 /// Get the status of a session. Returns `None` if the session doesn't exist.
 pub fn session_status(conn: &Connection, session_id: &str) -> anyhow::Result<Option<SessionStatus>> {
     let mut stmt = conn.prepare(
-        "SELECT status, address, txid, authenticated_at, otp_status
+        "SELECT status, address, txid, user_address, authenticated_at, otp_status
          FROM sessions WHERE session_id = ?1",
     )?;
     let row = stmt
@@ -118,8 +119,9 @@ pub fn session_status(conn: &Connection, session_id: &str) -> anyhow::Result<Opt
                 status: r.get(0)?,
                 address: r.get(1)?,
                 txid: r.get(2)?,
-                authenticated_at: r.get(3)?,
-                otp_status: r.get(4)?,
+                user_address: r.get(3)?,
+                authenticated_at: r.get(4)?,
+                otp_status: r.get(5)?,
             })
         })
         .optional()?;
@@ -132,11 +134,21 @@ pub struct SessionStatus {
     pub status: String,
     pub address: Option<String>,
     pub txid: Option<String>,
+    pub user_address: Option<String>,
     pub authenticated_at: Option<i64>,
     pub otp_status: Option<String>,
 }
 
 use rusqlite::OptionalExtension;
+
+/// Mark an OTP as sent for a session.
+pub fn set_otp_sent(conn: &Connection, session_id: &str, otp_code: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE sessions SET otp_challenge = ?1, otp_status = 'sent' WHERE session_id = ?2",
+        rusqlite::params![otp_code, session_id],
+    )?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

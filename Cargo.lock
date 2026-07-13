@@ -3490,6 +3490,7 @@ checksum = "eb0d78dcc345c36086112886223f6f1d6d224802808f15ac4f3ef144677029a1"
 dependencies = [
  "base64 0.22.1",
  "bech32 0.11.1",
+ "bip32",
  "bls12_381",
  "bs58",
  "byteorder",
@@ -3509,6 +3510,7 @@ dependencies = [
  "rand_core",
  "rayon",
  "sapling-crypto",
+ "secp256k1",
  "secrecy 0.8.0",
  "shardtree",
  "subtle",
@@ -3536,6 +3538,7 @@ version = "0.22.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9aa9b039e66a3b79f2de45ebf86cd82545232d332631a84f7c017ae21572b8de"
 dependencies = [
+ "bip32",
  "bitflags",
  "bs58",
  "byteorder",
@@ -3556,6 +3559,7 @@ dependencies = [
  "sapling-crypto",
  "schemerz",
  "schemerz-rusqlite",
+ "secp256k1",
  "secrecy 0.8.0",
  "shardtree",
  "static_assertions",
@@ -3592,6 +3596,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36391ebfce7df2510c6564f79e608ed93f1c0692c6464e2397b248e06dae3912"
 dependencies = [
  "bech32 0.11.1",
+ "bip32",
  "blake2b_simd",
  "bls12_381",
  "bs58",
@@ -3649,6 +3654,7 @@ dependencies = [
  "rand_core",
  "redjubjub",
  "sapling-crypto",
+ "secp256k1",
  "sha2 0.10.9",
  "zcash_encoding",
  "zcash_note_encryption",
@@ -3813,8 +3819,10 @@ dependencies = [
  "hmac 0.12.1",
  "libc",
  "orchard",
+ "prost",
  "rand",
  "rusqlite",
+ "sapling-crypto",
  "secrecy 0.8.0",
  "serde",
  "sha2 0.10.9",
@@ -3825,6 +3833,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "zcash_address",
  "zcash_client_backend",
  "zcash_client_sqlite",
  "zcash_keys",
@@ -3832,6 +3841,7 @@ dependencies = [
  "zcash_proofs",
  "zcash_protocol",
  "zip32",
+ "zip321",
 ]
 
 [[package]]

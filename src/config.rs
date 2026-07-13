@@ -67,6 +67,24 @@ pub struct Cli {
     /// lightwalletd (or Zaino) gRPC URL, e.g. "http://localhost:9067".
     #[arg(long, value_name = "URL")]
     pub lwd_url: Option<String>,
+
+    /// Subcommand. When omitted, runs the worker daemon.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum Command {
+    /// Create and initialize a new wallet (mnemonic + account), then exit.
+    Init(InitArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct InitArgs {
+    /// Restore from an existing mnemonic instead of generating a new one.
+    /// Read from ZFA_MNEMONIC env var or stdin.
+    #[arg(long)]
+    pub restore: bool,
 }
 
 /// On-disk TOML representation.
