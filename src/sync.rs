@@ -91,17 +91,17 @@ pub async fn sync_one_batch(
             .await?;
         let chain_state = tree_state.to_chain_state()?;
 
-        tokio::task::block_in_place(|| {
-            scan_or_rewind(
-                name,
-                params,
-                db_cache,
-                db_data,
-                scan_range.block_range().start,
-                &chain_state,
-                scan_range.len(),
-            )
-        })?;
+        // We run on a LocalSet (WalletDb is !Send), so block_in_place is
+        // unavailable. Call the CPU-bound scan directly.
+        scan_or_rewind(
+            name,
+            params,
+            db_cache,
+            db_data,
+            scan_range.block_range().start,
+            &chain_state,
+            scan_range.len(),
+        )?;
         Ok(())
     }
     .await;

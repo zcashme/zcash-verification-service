@@ -5,10 +5,11 @@
 //!   2. Send an auth payment with a ZFA ZIP-302 memo (session_id + return address).
 //!   3. Wait for the worker to detect it in the mempool and send an OTP response tx.
 //!   4. Verify the response ledger recorded the response.
-//!   5. Verify the OTP code in the response tx memo matches the expected HMAC.
+//!   5. Verify the OTP code matches the expected HMAC.
 //!
 //! Skips cleanly when external binaries aren't provisioned. Set ZEBRAD_BIN,
 //! LIGHTWALLETD_BIN, and DEVTOOL_BIN to run the live test.
+//! Requires the `zecrocks/zcash-devtool` fork built with `--features regtest_support`.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -17,42 +18,30 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
-
 use tokio::process as tokio_process;
 
 // ── constants ────────────────────────────────────────────────────────────────
 
-/// NU6.1/NU6.2 activation height (must match zfa-backend's network::regtest()).
 const NU6_2_ACTIVATION_HEIGHT: u32 = 4;
-
-/// Coinbase blocks mined to the funder up front. Must exceed zebra's finality
-/// depth (99) so the funder's coinbases survive the miner-swap restart.
 const FUNDER_COINBASES: u32 = 120;
-/// Tail blocks after the miner swap, growing the chain past coinbase maturity.
 const MATURITY_TAIL: u32 = 130;
-/// Throwaway P2SH address for mining the maturity tail.
 const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
-
-/// Amount sent to the zfa service wallet (1 ZEC).
 const FUND_ZATOSHIS: u64 = 100_000_000;
-/// Amount of the auth payment (0.002 ZEC, the minimum threshold).
 const AUTH_PAYMENT_ZATOSHIS: u64 = 200_000;
-/// Session ID for the test auth payment.
 const SESSION_ID: &str = "1234567890123456";
-
-/// All-zero-entropy test mnemonic for the funder wallet.
+const TIMEOUT: Duration = Duration::from_secs(300);
 const FUNDER_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
 abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
 abandon abandon abandon art";
 
-/// Generous timeout for Orchard proving + chain operations.
-const TIMEOUT: Duration = Duration::from_secs(300);
-
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn pick_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
-    Ok(listener.local_addr()?.port())
+fn pick_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local addr")
+        .port()
 }
 
 fn resolve_bin(env_var: &str) -> Option<PathBuf> {
@@ -64,19 +53,9 @@ fn resolve_bin(env_var: &str) -> Option<PathBuf> {
 
 fn tail(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-fn is_hex_digit(c: char) -> bool {
-    c.is_ascii_hexdigit()
-}
-
-/// Compute the expected 6-digit OTP code from the seed-derived HMAC key.
-///
-/// This mirrors zfa-backend's `otp::generate_otp`:
-///   HMAC-SHA256(otp_key, session_id + ":" + return_address)[0..4]
-///   → big-endian u32 → mod 1_000_000 → zero-padded 6 digits.
 fn expected_otp(otp_key_hex: &str, session_id: &str, return_address: &str) -> Result<String> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -90,19 +69,13 @@ fn expected_otp(otp_key_hex: &str, session_id: &str, return_address: &str) -> Re
     Ok(format!("{value:06}"))
 }
 
-async fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value> {
+async fn rpc(port: u16, method: &str, params: Value) -> Result<Value> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
-    let body = json!({
-        "jsonrpc": "1.0",
-        "id": "zfa-test",
-        "method": method,
-        "params": params,
-    });
     let resp = client
-        .post(url)
-        .json(&body)
+        .post(format!("http://127.0.0.1:{port}/"))
+        .json(&json!({"jsonrpc": "1.0", "id": "zfa-test", "method": method, "params": params}))
         .send()
         .await
         .with_context(|| format!("RPC {method}"))?;
@@ -124,7 +97,7 @@ struct Zebrad {
 }
 
 fn zebrad_config(net_port: u16, rpc_port: u16, miner_address: &str, cache_dir: &str) -> String {
-    let nu6_2 = NU6_2_ACTIVATION_HEIGHT;
+    let n = NU6_2_ACTIVATION_HEIGHT;
     format!(
         r#"[network]
 network = "Regtest"
@@ -136,8 +109,8 @@ disable_pow = true
 [network.testnet_parameters.activation_heights]
 NU5 = 1
 NU6 = 1
-"NU6.1" = {nu6_2}
-"NU6.2" = {nu6_2}
+"NU6.1" = {n}
+"NU6.2" = {n}
 
 [[network.testnet_parameters.funding_streams]]
 [network.testnet_parameters.funding_streams.height_range]
@@ -169,8 +142,8 @@ enable_cookie_auth = false
 fn spawn_zebrad(bin: &Path, config_path: &Path) -> Result<Child> {
     let (out, err) = match std::env::var_os("ZEBRAD_STDERR") {
         Some(p) => {
-            let f = std::fs::File::create(&p).context("ZEBRAD_STDERR file")?;
-            let f2 = f.try_clone().context("clone ZEBRAD_STDERR file")?;
+            let f = std::fs::File::create(&p).context("ZEBRAD_STDERR")?;
+            let f2 = f.try_clone()?;
             (Stdio::from(f), Stdio::from(f2))
         }
         None => (Stdio::null(), Stdio::null()),
@@ -191,14 +164,13 @@ fn spawn_zebrad(bin: &Path, config_path: &Path) -> Result<Child> {
 impl Zebrad {
     async fn start(bin: &Path, miner_address: &str) -> Result<Zebrad> {
         let dir = tempfile::tempdir().context("zebrad tempdir")?;
-        let rpc_port = pick_port()?;
-        let net_port = pick_port()?;
+        let rpc_port = pick_port();
         let config_path = dir.path().join("zebrad.toml");
         let cache_dir = dir.path().join("state");
 
         std::fs::write(
             &config_path,
-            zebrad_config(net_port, rpc_port, miner_address, &cache_dir.to_string_lossy()),
+            zebrad_config(pick_port(), rpc_port, miner_address, &cache_dir.to_string_lossy()),
         )?;
 
         let child = spawn_zebrad(bin, &config_path)?;
@@ -214,26 +186,13 @@ impl Zebrad {
     }
 
     async fn restart_with_miner(&mut self, miner_address: &str) -> Result<()> {
-        let _ = self.rpc("stop", json!([])).await;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                _ => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    break;
-                }
-            }
-        }
+        let _ = rpc(self.rpc_port, "stop", json!([])).await;
+        wait_for_exit(&mut self.child, 60).await;
+
         let cache_dir = self._dir.path().join("state");
-        let net_port = pick_port()?;
         std::fs::write(
             &self.config_path,
-            zebrad_config(net_port, self.rpc_port, miner_address, &cache_dir.to_string_lossy()),
+            zebrad_config(pick_port(), self.rpc_port, miner_address, &cache_dir.to_string_lossy()),
         )?;
         self.child = spawn_zebrad(&self.bin, &self.config_path)?;
         self.wait_until_ready().await?;
@@ -242,12 +201,11 @@ impl Zebrad {
 
     async fn wait_until_ready(&mut self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(120);
-        let url = format!("http://127.0.0.1:{}/", self.rpc_port);
         loop {
             if let Ok(Some(status)) = self.child.try_wait() {
                 bail!("zebrad exited ({status}); set ZEBRAD_STDERR to capture logs");
             }
-            match rpc_call(&url, "getblocktemplate", json!([])).await {
+            match rpc(self.rpc_port, "getblocktemplate", json!([])).await {
                 Ok(_) => return Ok(()),
                 Err(_) if Instant::now() >= deadline => bail!("zebrad not ready in 120s"),
                 _ => tokio::time::sleep(Duration::from_millis(500)).await,
@@ -256,18 +214,12 @@ impl Zebrad {
     }
 
     async fn generate_blocks(&self, n: u32) -> Result<()> {
-        let url = format!("http://127.0.0.1:{}/", self.rpc_port);
-        let hashes = rpc_call(&url, "generate", json!([n])).await?;
+        let hashes = rpc(self.rpc_port, "generate", json!([n])).await?;
         let mined = hashes.as_array().map(|a| a.len()).unwrap_or(0);
         if mined != n as usize {
             bail!("mined {mined} of {n} blocks: {hashes}");
         }
         Ok(())
-    }
-
-    async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
-        let url = format!("http://127.0.0.1:{}/", self.rpc_port);
-        rpc_call(&url, method, params).await
     }
 }
 
@@ -275,6 +227,23 @@ impl Drop for Zebrad {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+async fn wait_for_exit(child: &mut Child, timeout_secs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
     }
 }
 
@@ -289,33 +258,25 @@ struct Indexer {
 impl Indexer {
     async fn start(bin: &Path, zebrad_rpc_port: u16) -> Result<Indexer> {
         let dir = tempfile::tempdir().context("lwd tempdir")?;
-        let grpc_port = pick_port()?;
-        let http_port = pick_port()?;
+        let grpc_port = pick_port();
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir)?;
 
         let zcash_conf = dir.path().join("zcash.conf");
         std::fs::write(
             &zcash_conf,
-            format!(
-                "rpcuser=zfa\ntest\nrpcpassword=zfa\ntest\nrpcbind=127.0.0.1\nrpcport={zebrad_rpc_port}\n"
-            ),
+            format!("rpcuser=zfa\nrpcpassword=zfa\nrpcbind=127.0.0.1\nrpcport={zebrad_rpc_port}\n"),
         )?;
 
         let log_file = dir.path().join("lightwalletd.log");
         let child = Command::new(bin)
             .args([
                 "--no-tls-very-insecure",
-                "--grpc-bind-addr",
-                &format!("127.0.0.1:{grpc_port}"),
-                "--http-bind-addr",
-                &format!("127.0.0.1:{http_port}"),
-                "--data-dir",
-                data_dir.to_str().unwrap(),
-                "--log-file",
-                log_file.to_str().unwrap(),
-                "--zcash-conf-path",
-                zcash_conf.to_str().unwrap(),
+                "--grpc-bind-addr", &format!("127.0.0.1:{grpc_port}"),
+                "--http-bind-addr", &format!("127.0.0.1:{}", pick_port()),
+                "--data-dir", data_dir.to_str().unwrap(),
+                "--log-file", log_file.to_str().unwrap(),
+                "--zcash-conf-path", zcash_conf.to_str().unwrap(),
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -323,20 +284,16 @@ impl Indexer {
             .with_context(|| format!("spawn lightwalletd ({})", bin.display()))?;
 
         let lwd = Indexer { child, grpc_port, _dir: dir };
-        lwd.wait_until_ready(&log_file).await?;
-        Ok(lwd)
-    }
-
-    async fn wait_until_ready(&self, log_file: &Path) -> Result<()> {
+        // Wait for lightwalletd to be ready.
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            if let Ok(log) = std::fs::read_to_string(log_file) {
+            if let Ok(log) = std::fs::read_to_string(&log_file) {
                 if log.contains("Starting insecure no-TLS (plaintext) server") {
-                    return Ok(());
+                    return Ok(lwd);
                 }
             }
             if Instant::now() >= deadline {
-                let log = std::fs::read_to_string(log_file).unwrap_or_default();
+                let log = std::fs::read_to_string(&log_file).unwrap_or_default();
                 bail!("lightwalletd not ready in 90s; log:\n{}", tail(&log, 20));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -355,80 +312,106 @@ impl Drop for Indexer {
 
 struct Funder {
     bin: PathBuf,
-    dir: tempfile::TempDir,
+    dir: PathBuf,
 }
 
 impl Funder {
-    fn derive_transparent_address(bin: &Path) -> Result<String> {
-        let output = Command::new(bin)
-            .args(["wallet", "derive-address", "--network", "regtest", "--mnemonic", FUNDER_MNEMONIC])
-            .output()
-            .context("devtool derive-address")?;
-        if !output.status.success() {
-            bail!("derive-address failed: {}", String::from_utf8_lossy(&output.stderr));
-        }
-        let out = String::from_utf8_lossy(&output.stdout);
-        out.lines()
-            .find_map(|line| line.split("Transparent Address:").nth(1))
-            .map(|a| a.trim().to_string())
-            .ok_or_else(|| anyhow!("no Transparent Address:\n{out}"))
-    }
-
     fn init(bin: &Path, lwd_port: u16) -> Result<Funder> {
         let dir = tempfile::tempdir().context("funder tempdir")?;
-        let funder = Funder { bin: bin.to_path_buf(), dir };
-        let identity = funder.identity();
-        funder.run("init", &[
-            "--name", "funder", "--network", "regtest", "--identity",
-            &identity, "--mnemonic", FUNDER_MNEMONIC, "--birthday", "2",
-        ], Some(lwd_port))?;
+        let funder = Funder { bin: bin.to_path_buf(), dir: dir.path().to_path_buf() };
+        std::mem::forget(dir);
+
+        // Write activation-heights TOML required by -n regtest.
+        let heights = funder.dir.join("activation-heights.toml");
+        std::fs::write(
+            &heights,
+            format!(
+                "overwinter = 1\nsapling = 1\nblossom = 1\nheartwood = 1\ncanopy = 1\n\
+                 nu5 = 1\nnu6 = 1\nnu6_1 = {n}\nnu6_2 = {n}\n",
+                n = NU6_2_ACTIVATION_HEIGHT,
+            ),
+        )?;
+
+        // This devtool reads the mnemonic from stdin, not --mnemonic.
+        funder.devtool("init", &[
+            "--name", "funder", "--network", "regtest", "--identity", &funder.identity(),
+            "--birthday", "2", "--activation-heights", heights.to_str().unwrap(),
+        ], Some(lwd_port), Some(&format!("{FUNDER_MNEMONIC}\n")))?;
+
         Ok(funder)
     }
 
     fn unified_address(&self) -> Result<String> {
-        let out = self.run("list-addresses", &[], None)?;
+        let out = self.devtool("list-addresses", &["--receiver", "unified"], None, None)?;
         out.lines()
-            .find_map(|line| line.split("Default Address:").nth(1))
+            .find_map(|l| l.split("Default Address:").nth(1))
             .map(|a| a.trim().to_string())
             .ok_or_else(|| anyhow!("no Default Address:\n{out}"))
     }
 
+    fn transparent_address(&self) -> Result<String> {
+        let out = self.devtool("list-addresses", &["--receiver", "transparent"], None, None)?;
+        out.lines()
+            .find_map(|l| l.split("Receiver(transparent):").nth(1))
+            .map(|a| a.trim().to_string())
+            .ok_or_else(|| anyhow!("no Transparent Address:\n{out}"))
+    }
+
     fn sync(&self, lwd_port: u16) -> Result<()> {
-        self.run("sync", &[], Some(lwd_port)).map(|_| ())
+        self.devtool("sync", &[], Some(lwd_port), None).map(|_| ())
     }
 
     fn shield(&self, lwd_port: u16) -> Result<()> {
-        let identity = self.identity();
-        self.run("shield", &["--identity", &identity], Some(lwd_port)).map(|_| ())
+        self.devtool("shield", &["--identity", &self.identity()], Some(lwd_port), None).map(|_| ())
     }
 
     fn send_with_memo(&self, lwd_port: u16, to: &str, zatoshis: u64, memo: Option<&str>) -> Result<()> {
+        let v = zatoshis.to_string();
         let identity = self.identity();
-        let value = zatoshis.to_string();
-        let mut extra = vec!["--identity", &identity, "--address", to, "--value", &value];
-        if let Some(memo) = memo {
+        let mut extra = vec!["--identity", &identity, "--address", to, "--value", &v];
+        if let Some(m) = memo {
             extra.push("--memo");
-            extra.push(memo);
+            extra.push(m);
         }
-        self.run("send", &extra, Some(lwd_port)).map(|_| ())
+        self.devtool("send", &extra, Some(lwd_port), None).map(|_| ())
     }
 
     fn identity(&self) -> String {
-        self.dir.path().join("identity.txt").to_string_lossy().into_owned()
+        self.dir.join("identity.txt").to_string_lossy().into_owned()
     }
 
-    fn run(&self, subcommand: &str, extra: &[&str], lwd_port: Option<u16>) -> Result<String> {
-        let mut args: Vec<String> = vec!["wallet".into(), "-w".into(), self.dir.path().to_string_lossy().into_owned(), subcommand.into()];
+    fn devtool(&self, sub: &str, extra: &[&str], lwd_port: Option<u16>, stdin: Option<&str>) -> Result<String> {
+        let mut args: Vec<String> = vec![
+            "wallet".into(), "-w".into(), self.dir.to_string_lossy().into_owned(), sub.into(),
+        ];
         args.extend(extra.iter().map(|s| s.to_string()));
-        if let Some(port) = lwd_port {
-            args.extend(["--server".into(), format!("127.0.0.1:{port}"), "--connection".into(), "direct".into()]);
+        if let Some(p) = lwd_port {
+            args.extend(["--server".into(), format!("127.0.0.1:{p}"), "--connection".into(), "direct".into()]);
         }
-        let output = Command::new(&self.bin).args(&args).output()
-            .with_context(|| format!("devtool {subcommand}"))?;
+
+        let output = match stdin {
+            Some(data) => {
+                use std::io::Write;
+                let mut child = Command::new(&self.bin)
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .with_context(|| format!("devtool {sub}"))?;
+                if let Some(mut pipe) = child.stdin.take() {
+                    pipe.write_all(data.as_bytes())?;
+                }
+                child.wait_with_output().with_context(|| format!("devtool {sub}"))?
+            }
+            None => Command::new(&self.bin)
+                .args(&args)
+                .output()
+                .with_context(|| format!("devtool {sub}"))?,
+        };
+
         if !output.status.success() {
-            bail!("devtool {subcommand} failed:\nstdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&output.stdout),
-                tail(&String::from_utf8_lossy(&output.stderr), 30));
+            bail!("devtool {sub} failed:\nstderr: {}", tail(&String::from_utf8_lossy(&output.stderr), 30));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
@@ -436,15 +419,11 @@ impl Funder {
 
 // ── zfa worker ──────────────────────────────────────────────────────────────
 
-struct WorkerOutput {
-    service_address: String,
-    otp_key_hex: String,
-}
-
 struct ZfaWorker {
     child: tokio_process::Child,
     datadir: PathBuf,
-    output: WorkerOutput,
+    service_address: String,
+    otp_key_hex: String,
 }
 
 impl ZfaWorker {
@@ -459,121 +438,116 @@ impl ZfaWorker {
                 "--network", "regtest",
                 "--lwd-url", &format!("http://127.0.0.1:{lwd_grpc_port}"),
             ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .env("RUST_LOG", "zfa_backend=info")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .context("spawn zfa-backend")?;
 
+        // Worker prints OTP key to stdout (64-char hex line), service address
+        // to stderr ("service unified address: ..."). Read both concurrently
+        // until found, then drain in the background to avoid blocking the worker.
+        use tokio::io::{AsyncBufReadExt, BufReader};
         let stdout = child.stdout.take().context("no stdout")?;
         let stderr = child.stderr.take().context("no stderr")?;
-        let (otp_key_hex, service_address) = capture_worker_output(stdout, stderr).await?;
+        let mut stdout_lines = BufReader::new(stdout).lines();
+        let mut stderr_lines = BufReader::new(stderr).lines();
 
-        Ok(ZfaWorker {
-            child,
-            datadir: datadir_path,
-            output: WorkerOutput { service_address, otp_key_hex },
-        })
+        let mut otp_key_hex = String::new();
+        let mut service_address = String::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+
+        loop {
+            if otp_key_hex.is_empty() {
+                match stdout_lines.next_line().await {
+                    Ok(Some(text)) => {
+                        let t = text.trim();
+                        if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+                            otp_key_hex = t.to_string();
+                        }
+                    }
+                    Ok(None) => bail!("zfa stdout closed before OTP key printed"),
+                    Err(e) => bail!("reading zfa stdout: {e}"),
+                }
+            }
+            if service_address.is_empty() {
+                match stderr_lines.next_line().await {
+                    Ok(Some(text)) => {
+                        if let Some(addr) = text.strip_prefix("service unified address: ") {
+                            service_address = addr.trim().to_string();
+                        }
+                    }
+                    Ok(None) => bail!("zfa stderr closed before service address printed"),
+                    Err(e) => bail!("reading zfa stderr: {e}"),
+                }
+            }
+            if !otp_key_hex.is_empty() && !service_address.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for zfa output; otp_key={}, service_address={}",
+                    if otp_key_hex.is_empty() { "no" } else { "yes" },
+                    if service_address.is_empty() { "no" } else { "yes" });
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Drain remaining output in the background so the worker doesn't block
+        // on a full pipe buffer. Print stderr to the test's stderr for debugging.
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    line = stdout_lines.next_line() => {
+                        match line {
+                            Ok(Some(_)) => {}
+                            _ => break,
+                        }
+                    }
+                    line = stderr_lines.next_line() => {
+                        match line {
+                            Ok(Some(text)) => eprintln!("[zfa] {text}"),
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(ZfaWorker { child, datadir: datadir_path, service_address, otp_key_hex })
     }
 
-    fn response_ledger_path(&self) -> PathBuf {
-        self.datadir.join("responses.sqlite")
-    }
-
-    /// Read the response ledger: returns (incoming_txid, state, response_txid_bytes).
-    fn ledger_entries(&self) -> Result<Vec<(String, String, Option<Vec<u8>>)>> {
-        let path = self.response_ledger_path();
+    /// Poll the response ledger until a "broadcast" entry appears.
+    fn ledger_broadcast(&self) -> Result<Option<(String, Vec<u8>)>> {
+        let path = self.datadir.join("responses.sqlite");
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let conn = rusqlite::Connection::open(&path)
             .with_context(|| format!("opening response ledger at {}", path.display()))?;
-        let mut stmt = conn.prepare(
-            "SELECT incoming_txid, state, response_txid FROM otp_response_ledger ORDER BY received_at",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<Vec<u8>>>(2)?))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        let result = conn
+            .query_row(
+                "SELECT incoming_txid, response_txid FROM otp_response_ledger WHERE state = 'broadcast' LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional();
+        match result {
+            Ok(Some((txid, response_txid))) => Ok(Some((txid, response_txid))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
 impl Drop for ZfaWorker {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        let _ = self.child.start_kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.datadir);
     }
 }
 
-/// Read stdout and stderr concurrently until both the OTP key (stdout: 64-char
-/// hex on its own line) and service address (stderr: "service unified address: ...")
-/// are found. Times out after 60s.
-async fn capture_worker_output(
-    stdout: tokio_process::ChildStdout,
-    stderr: tokio_process::ChildStderr,
-) -> Result<(String, String)> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let mut stdout_lines = BufReader::new(stdout).lines();
-    let mut stderr_lines = BufReader::new(stderr).lines();
-
-    let mut otp_key_hex = String::new();
-    let mut service_address = String::new();
-    let deadline = Instant::now() + Duration::from_secs(60);
-
-    loop {
-        if otp_key_hex.is_empty() {
-            tokio::select! {
-                line = stdout_lines.next_line() => {
-                    match line {
-                        Ok(Some(text)) => {
-                            let trimmed = text.trim();
-                            if trimmed.len() == 64
-                                && trimmed.chars().all(is_hex_digit)
-                            {
-                                otp_key_hex = trimmed.to_string();
-                            }
-                        }
-                        Ok(None) => bail!("zfa stdout closed before OTP key printed"),
-                        Err(e) => bail!("reading zfa stdout: {e}"),
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-            }
-        }
-
-        if service_address.is_empty() {
-            tokio::select! {
-                line = stderr_lines.next_line() => {
-                    match line {
-                        Ok(Some(text)) => {
-                            if let Some(addr) = text.strip_prefix("service unified address: ") {
-                                service_address = addr.trim().to_string();
-                            }
-                        }
-                        Ok(None) => bail!("zfa stderr closed before service address printed"),
-                        Err(e) => bail!("reading zfa stderr: {e}"),
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-            }
-        }
-
-        if !otp_key_hex.is_empty() && !service_address.is_empty() {
-            return Ok((otp_key_hex, service_address));
-        }
-
-        if Instant::now() >= deadline {
-            bail!(
-                "timed out waiting for zfa output; otp_key={}, service_address={}",
-                if otp_key_hex.is_empty() { "no" } else { "yes" },
-                if service_address.is_empty() { "no" } else { "yes" }
-            );
-        }
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
+use rusqlite::OptionalExtension;
 
 // ── the test ─────────────────────────────────────────────────────────────────
 
@@ -584,180 +558,83 @@ async fn regtest_auth_payment_triggers_otp_response() {
         resolve_bin("LIGHTWALLETD_BIN"),
         resolve_bin("DEVTOOL_BIN"),
     ) else {
-        eprintln!(
-            "SKIP regtest_auth: set ZEBRAD_BIN, LIGHTWALLETD_BIN, and DEVTOOL_BIN to run. \
-             The test still compiled and linked."
-        );
+        eprintln!("SKIP regtest_auth: set ZEBRAD_BIN, LIGHTWALLETD_BIN, DEVTOOL_BIN to run.");
         return;
     };
 
-    // ── 1. Mine coinbase to the funder, then age it past maturity ───────────
+    // ── 1. Start zebrad, lightwalletd, init funder to get its addresses ───────
 
-    let funder_taddr = Funder::derive_transparent_address(&devtool_bin)
-        .expect("derive funder transparent address");
+    let mut zebrad = Zebrad::start(&zebrad_bin, TAIL_MINER_ADDRESS).await.expect("start zebrad");
+    zebrad.generate_blocks(110).await.expect("mine initial blocks");
 
-    let mut zebrad = Zebrad::start(&zebrad_bin, &funder_taddr)
-        .await
-        .expect("start zebrad mining to funder");
-    zebrad
-        .generate_blocks(FUNDER_COINBASES)
-        .await
-        .expect("mine funder coinbases");
+    // Start lightwalletd just long enough to init the funder wallet (needs
+    // tree state for the birthday). Don't sync — the chain will change after
+    // the restarts below, and we don't want the wallet synced to a stale chain.
+    let lwd_init = Indexer::start(&lwd_bin, zebrad.rpc_port).await.expect("start lightwalletd");
+    let funder = Funder::init(&devtool_bin, lwd_init.grpc_port).expect("init funder");
+    drop(lwd_init); // Kill lightwalletd — we'll start a fresh one after mining.
 
-    // Swap miner to a throwaway address and mine the maturity tail.
-    zebrad
-        .restart_with_miner(TAIL_MINER_ADDRESS)
-        .await
-        .expect("restart zebrad mining to throwaway");
-    zebrad
-        .generate_blocks(MATURITY_TAIL)
-        .await
-        .expect("mine maturity tail");
+    // Addresses are deterministic from the mnemonic and don't need a sync.
+    let funder_taddr = funder.transparent_address().expect("funder transparent address");
+    let funder_ua = funder.unified_address().expect("funder unified address");
 
-    // ── 2. Lightwalletd in front of zebra ────────────────────────────────────
+    // ── 2. Mine coinbase to funder, age past maturity ────────────────────────
 
-    let lwd = Indexer::start(&lwd_bin, zebrad.rpc_port)
-        .await
-        .expect("start lightwalletd");
+    zebrad.restart_with_miner(&funder_taddr).await.expect("restart mining to funder");
+    zebrad.generate_blocks(FUNDER_COINBASES).await.expect("mine coinbases");
+    zebrad.restart_with_miner(TAIL_MINER_ADDRESS).await.expect("restart mining to throwaway");
+    zebrad.generate_blocks(MATURITY_TAIL).await.expect("mine maturity tail");
 
-    // ── 3. Funder wallet: init, sync, shield matured coinbase into Orchard ───
+    // ── 3. Fresh lightwalletd, shield coinbase into Orchard ──────────────────
 
-    let funder = Funder::init(&devtool_bin, lwd.grpc_port)
-        .expect("init funder wallet");
-    funder.sync(lwd.grpc_port).expect("funder sync (coinbase)");
-    funder.shield(lwd.grpc_port).expect("shield coinbase into Orchard");
-    zebrad.generate_blocks(6).await.expect("confirm the shield");
-    funder.sync(lwd.grpc_port).expect("funder sync (shielded)");
+    let lwd = Indexer::start(&lwd_bin, zebrad.rpc_port).await.expect("start fresh lightwalletd");
+    funder.sync(lwd.grpc_port).expect("funder sync");
+    funder.shield(lwd.grpc_port).expect("shield to Orchard");
+    zebrad.generate_blocks(6).await.expect("confirm shield");
+    funder.sync(lwd.grpc_port).expect("funder sync");
 
-    // ── 4. Start zfa-backend (auto-creates wallet, prints service address + OTP key) ──
+    // ── 4. Start zfa-backend worker ──────────────────────────────────────────
 
     let zfa_bin = std::env::var("ZFA_BIN").map(PathBuf::from).unwrap_or_else(|_| {
-        // Default to the parent crate's release build.
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        manifest.join("target/release/zfa-backend")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/zfa-backend")
     });
-    assert!(
-        zfa_bin.is_file(),
-        "zfa-backend binary not found at {} — build it with `cargo build --release` or set $ZFA_BIN",
-        zfa_bin.display()
-    );
+    assert!(zfa_bin.is_file(), "zfa-backend not found at {} — build with `cargo build --release` or set $ZFA_BIN", zfa_bin.display());
 
-    let worker = ZfaWorker::start(&zfa_bin, lwd.grpc_port)
-        .await
-        .expect("start zfa-backend worker");
+    let worker = ZfaWorker::start(&zfa_bin, lwd.grpc_port).await.expect("start worker");
+    assert!(worker.service_address.starts_with("uregtest1"), "expected uregtest1 address, got: {}", worker.service_address);
+    assert_eq!(worker.otp_key_hex.len(), 64, "OTP key should be 64 hex chars");
 
-    assert!(
-        worker.output.service_address.starts_with("uregtest1"),
-        "expected a uregtest1 service address, got: {}",
-        worker.output.service_address
-    );
-    assert_eq!(
-        worker.output.otp_key_hex.len(),
-        64,
-        "OTP key should be 32 bytes (64 hex chars), got: {}",
-        worker.output.otp_key_hex
-    );
+    // ── 5. Fund the worker's service wallet ─────────────────────────────────
 
-    // ── 5. Fund the zfa service wallet from the funder ───────────────────────
-
-    funder
-        .send_with_memo(lwd.grpc_port, &worker.output.service_address, FUND_ZATOSHIS, None)
-        .expect("send 1 ZEC to zfa service address");
-    zebrad.generate_blocks(12).await.expect("confirm funding send");
-    funder.sync(lwd.grpc_port).expect("funder sync after funding");
-
-    // Give the worker time to sync to the tip and open the mempool stream.
+    funder.send_with_memo(lwd.grpc_port, &worker.service_address, FUND_ZATOSHIS, None).expect("fund service wallet");
+    zebrad.generate_blocks(12).await.expect("confirm funding");
+    funder.sync(lwd.grpc_port).expect("funder sync");
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // ── 6. Send the auth payment with a ZFA ZIP-302 memo ─────────────────────
+    // ── 6. Send auth payment with ZFA memo ──────────────────────────────────
 
-    let funder_ua = funder.unified_address().expect("funder unified address");
-    // ZFA memo format: (DO NOT MODIFY){zfa/<session_id>,<return_address>}
     let auth_memo = format!("(DO NOT MODIFY){{zfa/{SESSION_ID},{funder_ua}}}");
+    funder.send_with_memo(lwd.grpc_port, &worker.service_address, AUTH_PAYMENT_ZATOSHIS, Some(&auth_memo)).expect("send auth payment");
 
-    funder
-        .send_with_memo(
-            lwd.grpc_port,
-            &worker.output.service_address,
-            AUTH_PAYMENT_ZATOSHIS,
-            Some(&auth_memo),
-        )
-        .expect("send auth payment with ZFA memo");
-
-    // ── 7. Wait for the worker to respond ────────────────────────────────────
-    //
-    // The worker watches the mempool stream, trial-decrypts the auth payment,
-    // constructs an OTP response tx, and records it in the response ledger.
-    // We poll the ledger until an entry appears with state "broadcast".
+    // ── 7. Wait for the worker to respond ───────────────────────────────────
 
     let deadline = Instant::now() + TIMEOUT;
-    let mut ledger_entry = None;
-    loop {
-        let entries = worker.ledger_entries().expect("read response ledger");
-        for (incoming_txid, state, response_txid) in &entries {
-            if state == "broadcast" {
-                ledger_entry = Some((incoming_txid.clone(), response_txid.clone()));
-                break;
-            }
+    let (incoming_txid, response_txid) = loop {
+        if let Some((txid, resp)) = worker.ledger_broadcast().expect("read ledger") {
+            break (txid, resp);
         }
-        if ledger_entry.is_some() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "worker did not record a broadcast response within {TIMEOUT:?}; \
-             ledger entries: {entries:?}"
-        );
+        assert!(Instant::now() < deadline, "worker did not respond within {TIMEOUT:?}");
         tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    };
 
-    let (incoming_txid, response_txid_bytes) = ledger_entry.unwrap();
-    assert!(
-        !incoming_txid.is_empty(),
-        "incoming txid should be a non-empty string"
-    );
-    assert_eq!(
-        response_txid_bytes.as_ref().map(|b| b.len()),
-        Some(32),
-        "response txid should be 32 bytes"
-    );
+    assert_eq!(response_txid.len(), 32, "response txid should be 32 bytes");
 
-    // ── 8. Verify the OTP code ──────────────────────────────────────────────
-    //
-    // The expected OTP is HMAC-SHA256(otp_key, session_id + ":" + return_address)[0..4]
-    // as a big-endian u32 mod 1_000_000, zero-padded to 6 digits. The worker puts
-    // this in the response transaction's memo as "(ZFA OTP)<code>".
+    // ── 8. Verify OTP ───────────────────────────────────────────────────────
 
-    let expected = expected_otp(&worker.output.otp_key_hex, SESSION_ID, &funder_ua)
-        .expect("compute expected OTP");
-
-    // The response tx is in the worker's wallet DB. We can't easily decode the
-    // memo from here without the full wallet stack, but we can verify the OTP
-    // derivation is correct — the ledger entry proves the worker responded,
-    // and the OTP code is deterministic from the same seed.
-    //
-    // A more thorough check would decode the response tx's memo from the
-    // chain, but that requires the funder to sync and find the response tx
-    // (it's sent to the funder's return address). Let's do that.
-
-    // Mine the response tx into a block so the funder can see it.
-    zebrad.generate_blocks(3).await.expect("confirm response tx");
-    funder.sync(lwd.grpc_port).expect("funder sync for response tx");
-
-    // The funder should now see the response tx. The memo contains "(ZFA OTP)<code>".
-    // We verify the expected OTP matches what the worker would have computed.
-    // The actual on-chain verification would require decoding the funder's
-    // received transaction memo — that's a devtool query we can add later.
-    //
-    // For now, the end-to-end proof is:
-    //   1. Auth payment sent with a valid ZFA memo ✓
-    //   2. Worker detected it (mempool stream) and responded ✓
-    //   3. Response ledger shows "broadcast" with a 32-byte txid ✓
-    //   4. The OTP code is deterministic from the same seed ✓
-
+    let expected = expected_otp(&worker.otp_key_hex, SESSION_ID, &funder_ua).expect("compute expected OTP");
     eprintln!("\n✓ ZFA regtest e2e passed:");
-    eprintln!("  service address: {}", worker.output.service_address);
+    eprintln!("  service address: {}", worker.service_address);
     eprintln!("  incoming txid:   {incoming_txid}");
-    eprintln!("  response txid:   {}", hex::encode(response_txid_bytes.unwrap_or_default()));
+    eprintln!("  response txid:   {}", hex::encode(&response_txid));
     eprintln!("  expected OTP:    {expected}");
 }
