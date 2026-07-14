@@ -433,22 +433,88 @@ impl WalletActor {
     }
 
     /// Send an OTP response transaction to the user's address with the OTP code in the memo.
-    ///
-    /// TODO: This is currently disabled due to a Rust type inference issue with
-    /// `propose_transfer`'s complex generic bounds. The transaction construction
-    /// and broadcasting logic is ready — the issue is purely a compile-time type
-    /// inference problem that needs a helper function with explicit bounds to resolve.
     async fn send_otp_response(
         &mut self,
         recipient_address: &str,
         otp_code: &str,
     ) -> anyhow::Result<String> {
-        // For now, just log the OTP — the frontend can read it from zfa.db.
-        info!(
-            "[zfa] OTP response (not yet sent via tx): addr={recipient_address} otp={otp_code}"
-        );
-        Ok(String::new())
+        info!("[zfa] building OTP response tx to {} with OTP {}", recipient_address, otp_code);
+        let account_id = self.account_id.ok_or_else(|| anyhow::anyhow!("no account"))?;
+        
+        let zaddr = zcash_address::ZcashAddress::try_from_encoded(recipient_address)
+            .map_err(|e| anyhow::anyhow!("invalid recipient address: {e}"))?;
+            
+        let memo_str = format!("(ZFA OTP){otp_code}");
+        let mut memo_bytes = [0u8; 512];
+        let bytes = memo_str.as_bytes();
+        let len = bytes.len().min(512);
+        memo_bytes[..len].copy_from_slice(&bytes[..len]);
+        let memo = zcash_protocol::memo::MemoBytes::from_bytes(&memo_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid memo: {e}"))?;
+
+        let payment = zip321::Payment::new(
+            zaddr,
+            Some(
+                zcash_protocol::value::Zatoshis::from_u64(1_000)
+                    .map_err(|e| anyhow::anyhow!("invalid amount: {e}"))?,
+            ),
+            Some(memo),
+            None,
+            None,
+            vec![],
+        )
+        .map_err(|e| anyhow::anyhow!("invalid payment: {e}"))?;
+        
+        let request = zip321::TransactionRequest::new(vec![payment])
+            .map_err(|e| anyhow::anyhow!("invalid transaction request: {e}"))?;
+
+        let usk = self.seed.derive_usk(self.network, zip32::AccountId::try_from(0u32).unwrap())?;
+        
+        let txids = do_send_otp_response(
+            &mut self.db_data,
+            &self.network,
+            account_id,
+            request,
+            &usk,
+            &self.prover,
+        )?;
+        
+        if txids.is_empty() {
+            return Err(anyhow::anyhow!("no txids created"));
+        }
+        let txid = txids[0];
+        
+        // Broadcast
+        use zcash_client_backend::data_api::WalletRead;
+        let tx_data = self.db_data
+            .get_transaction(txid)
+            .map_err(|e| anyhow::anyhow!("getting transaction: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("transaction not found after creation"))?;
+            
+        let mut buf = Vec::new();
+        use zcash_primitives::transaction::Transaction as TxTrait;
+        TxTrait::write(&tx_data, &mut buf)
+            .map_err(|e| anyhow::anyhow!("serializing transaction: {e}"))?;
+            
+        let txid_hex = txid.to_string();
+        info!("[zfa] broadcasting OTP response tx {}", txid_hex);
+        
+        let (error_code, error_message) = self
+            .client
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("not connected"))?
+            .send_transaction(buf)
+            .await?;
+
+        if error_code != 0 {
+            return Err(anyhow::anyhow!(
+                "lightwalletd rejected transaction: code {error_code}, message: {error_message}"
+            ));
+        }
+
+        Ok(txid_hex)
     }
+
 
     /// Query the wallet DB for a memo matching this txid, and try to parse it
     /// as a ZFA session memo.
@@ -486,4 +552,49 @@ impl WalletActor {
         }
         None
     }
+}
+fn do_send_otp_response(
+    db: &mut WriteDb,
+    net: &ZNetwork,
+    account_id: zcash_client_sqlite::AccountUuid,
+    request: zip321::TransactionRequest,
+    usk: &zcash_keys::keys::UnifiedSpendingKey,
+    prover: &zcash_proofs::prover::LocalTxProver,
+) -> anyhow::Result<Vec<TxId>> {
+    let change_strategy = zcash_client_backend::fees::standard::MultiOutputChangeStrategy::new(
+        zcash_client_backend::fees::StandardFeeRule::Zip317,
+        None,
+        zcash_protocol::ShieldedPool::Orchard,
+        zcash_client_backend::fees::DustOutputPolicy::default(),
+        zcash_client_backend::fees::SplitPolicy::with_min_output_value(
+            std::num::NonZeroUsize::new(4).unwrap(),
+            zcash_protocol::value::Zatoshis::from_u64(10_000_000).unwrap(),
+        ),
+    );
+    let input_selector = zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelector::new();
+    let policy = zcash_client_backend::data_api::wallet::ConfirmationsPolicy::default();
+
+    let proposal = zcash_client_backend::data_api::wallet::propose_transfer(
+        db,
+        net,
+        account_id,
+        &input_selector,
+        &change_strategy,
+        request,
+        policy,
+        &zcash_client_backend::data_api::wallet::input_selection::SpendPolicy::default(),
+        None,
+    ).map_err(|e: zcash_client_backend::data_api::error::Error<_, zcash_client_sqlite::wallet::commitment_tree::Error, _, _, _, _>| anyhow::anyhow!("propose error: {:?}", e))?;
+
+    let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions(
+        db,
+        net,
+        prover,
+        prover,
+        &zcash_client_backend::data_api::wallet::SpendingKeys::from_unified_spending_key(usk.clone()),
+        zcash_client_backend::wallet::OvkPolicy::Sender,
+        &proposal,
+    ).map_err(|e: zcash_client_backend::data_api::error::Error<_, _, zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError, _, zcash_primitives::transaction::fees::zip317::FeeError, _>| anyhow::anyhow!("create error: {:?}", e))?;
+
+    Ok(txids.into())
 }
