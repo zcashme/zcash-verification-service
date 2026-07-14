@@ -120,27 +120,23 @@ pub struct Cli {
     #[arg(long, value_name = "URL")]
     pub lwd_url: Option<String>,
 
-    /// Subcommand. When omitted, runs the worker daemon.
-    #[command(subcommand)]
-    pub command: Option<Command>,
-}
+    /// Mnemonic phrase to restore from. If omitted, a fresh wallet is generated.
+    #[arg(long, value_name = "PHRASE")]
+    pub mnemonic: Option<String>,
 
-#[derive(Debug, clap::Subcommand)]
-pub enum Command {
-    /// Create and initialize a new wallet (mnemonic + account), then exit.
-    Init(InitArgs),
-}
-
-#[derive(Debug, clap::Args)]
-pub struct InitArgs {
-    /// Restore from an existing mnemonic instead of generating a new one.
-    /// Read from ZFA_MNEMONIC env var or stdin.
-    #[arg(long)]
-    pub restore: bool,
-
-    /// Earliest block that may contain funds for this wallet. Required when
-    /// restoring; new wallets default to the chain tip at initialization.
+    /// Earliest block that may contain funds. Required when --mnemonic is provided;
+    /// new wallets default to the chain tip.
     #[arg(long, value_name = "HEIGHT")]
+    pub birthday: Option<u32>,
+}
+
+/// Wallet initialization parameters, derived from CLI flags.
+/// Not a clap subcommand — constructed by `main` from `Cli` fields.
+#[derive(Debug, Clone)]
+pub struct InitArgs {
+    /// Mnemonic phrase to restore from, or `None` to generate a fresh wallet.
+    pub mnemonic: Option<String>,
+    /// Birthday block height. Required when restoring; ignored for fresh wallets.
     pub birthday: Option<u32>,
 }
 

@@ -53,6 +53,9 @@ use tracing::info;
 
 /// Initialize a new wallet: generate (or restore) a mnemonic, create an age
 /// identity, derive the UFVK, write `zfa.toml`, and create the wallet account.
+///
+/// If `args.mnemonic` is `Some`, restores from that phrase (requires
+/// `args.birthday`). If `None`, generates a fresh 24-word mnemonic.
 pub async fn init_wallet(
     config: &config::AppConfig,
     args: &config::InitArgs,
@@ -74,20 +77,13 @@ pub async fn init_wallet(
 
     std::fs::create_dir_all(&config.datadir)?;
 
-    // Generate or restore mnemonic.
-    let mnemonic = if args.restore {
-        let phrase = std::env::var("ZFA_MNEMONIC")
-            .map(|p| p.trim().to_string())
-            .or_else(|_| {
-                use std::io::Read;
-                eprintln!("Enter the mnemonic phrase to restore:");
-                let mut line = String::new();
-                std::io::stdin().read_to_string(&mut line)?;
-                Ok::<String, anyhow::Error>(line.trim().to_string())
-            })?;
-        <Mnemonic<English>>::from_phrase(&phrase)?
-    } else {
-        Mnemonic::generate(Count::Words24)
+    // Generate or restore mnemonic. The presence of --mnemonic determines mode.
+    let (mnemonic, is_restore) = match &args.mnemonic {
+        Some(phrase) => (
+            <Mnemonic<English>>::from_phrase(phrase.trim())?,
+            true,
+        ),
+        None => (Mnemonic::generate(Count::Words24), false),
     };
 
     // Create an age identity, or safely reuse one left by an interrupted
@@ -127,8 +123,8 @@ pub async fn init_wallet(
     let birthday_height = match args.birthday {
         Some(0) => anyhow::bail!("wallet birthday must be at least height 1"),
         Some(height) => zcash_protocol::consensus::BlockHeight::from_u32(height),
-        None if args.restore => {
-            anyhow::bail!("--birthday is required when restoring an existing wallet")
+        None if is_restore => {
+            anyhow::bail!("--birthday is required when restoring from a mnemonic")
         }
         None => {
             let tip = bootstrap_client.get_latest_block().await?;
@@ -184,8 +180,11 @@ pub async fn init_wallet(
     println!("{otp_hex}");
     eprintln!();
 
-    if !args.restore {
-        eprintln!("IMPORTANT — record this mnemonic and keep it safe:\n");
+    if !is_restore {
+        eprintln!(
+            "\n⚠  NEW WALLET — record this mnemonic and store it securely.\
+             \n   This is the ONLY time it will be displayed.\n"
+        );
         println!("{}", mnemonic.phrase());
         eprintln!();
     }
@@ -240,13 +239,20 @@ fn ensure_identity(path: &std::path::Path) -> anyhow::Result<Vec<Box<dyn age::Re
 /// 3. Connects to the lightwalletd gRPC endpoint.
 /// 4. Spawns the single-writer actor (sync loop + mempool watcher).
 /// 5. Waits for SIGINT/SIGTERM, then shuts down gracefully.
-pub async fn run(config: config::AppConfig) -> anyhow::Result<()> {
+pub async fn run(config: config::AppConfig, init_args: config::InitArgs) -> anyhow::Result<()> {
     info!(
         network = config.network.name(),
         lwd_url = %config.lwd_url,
         datadir = %config.datadir.display(),
         "starting ZFA authentication worker"
     );
+
+    // If the wallet hasn't been initialized yet, create it now.
+    if !wallet::store::WalletStore::exists(&config.seed_path) {
+        info!("wallet not initialized — creating now");
+        init_wallet(&config, &init_args).await?;
+        info!("wallet initialized — starting worker");
+    }
 
     let response_ledger_path = config.datadir.join("responses.sqlite");
     let _response_ledger = response_ledger::init_db(&response_ledger_path)?;
