@@ -2,64 +2,67 @@
 //! the sync loop and the mempool watcher.
 //!
 //! Ported from zecd's `wallet/actor.rs`, stripped to ZFA's needs and extended
-//! with session authentication and automatic OTP response sending.
+//! with automatic OTP response sending.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Context as _;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use zcash_client_backend::data_api::wallet::{
-    create_proposed_transactions, decrypt_and_store_transaction,
     input_selection::{GreedyInputSelector, SpendPolicy},
-    propose_transfer, ConfirmationsPolicy, SpendingKeys,
+    ConfirmationsPolicy, SpendingKeys,
 };
-use zcash_client_backend::data_api::{Account as _, WalletRead as _, WalletWrite as _};
+use zcash_client_backend::data_api::{WalletRead as _, WalletWrite as _};
 use zcash_client_backend::fees::{
     standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
 };
 use zcash_client_backend::wallet::OvkPolicy;
+use zcash_client_backend::{decrypt_transaction, DecryptedOutput, TransferType};
 use zcash_client_sqlite::FsBlockDb;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_primitives::transaction::Transaction;
+use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::TxId;
-use zcash_proofs::prover::LocalTxProver;
 
 use crate::backoff::Backoff;
 use crate::lwd::LwdClient;
 use crate::memo;
 use crate::network::ZNetwork;
 use crate::otp;
-use crate::session;
+use crate::response_ledger::{self, Claim, ResponseState};
 use crate::sync as sync_engine;
-use crate::wallet::keys::{self, SeedKeeper};
+use crate::wallet::binding;
+use crate::wallet::keys::{self, OtpSecret, SeedKeeper};
 use crate::wallet::open::{self, WriteDb};
 use crate::wallet::store::WalletStore;
 
 /// Note-management defaults (from zecd).
 const TARGET_NOTE_COUNT: usize = 4;
 const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
-/// Fixed OTP response amount (1000 zats = 0.00001 ZEC).
+/// An incoming note must pay at least 0.002 ZEC to request an OTP response.
+const MIN_AUTH_PAYMENT: u64 = 200_000;
+/// Fixed OTP response amount, retained from the original worker.
 const OTP_RESPONSE_AMOUNT: u64 = 1_000;
 
 /// Parameters needed to launch the wallet actor.
 pub struct ActorConfig {
     pub network: ZNetwork,
     pub wallet_dir: PathBuf,
-    pub keys_path: PathBuf,
+    /// Path to the file containing the `[seed]` table (zfa.toml or --keys-file).
+    pub seed_path: PathBuf,
+    /// Path to the age identity file that decrypts the mnemonic.
+    pub identity_path: PathBuf,
     pub lwd_url: String,
-    pub session_ttl_secs: u64,
     pub sync_interval: Duration,
     pub connect_timeout: Duration,
     pub reconnect_base: Duration,
     pub reconnect_max: Duration,
-    pub age_identity: Option<PathBuf>,
-    pub zfa_db_path: PathBuf,
+    pub response_ledger_path: PathBuf,
     pub shutdown: watch::Receiver<bool>,
 }
 
@@ -68,36 +71,29 @@ pub async fn build(cfg: ActorConfig) -> anyhow::Result<WalletActor> {
     let mut db_data = open::init_dbs(cfg.network, &cfg.wallet_dir)?;
     let db_cache = open::open_fsblockdb(&cfg.wallet_dir)?;
 
-    let store = WalletStore::read(&cfg.keys_path)?;
+    let store = WalletStore::read(&cfg.seed_path)?;
 
+    let seed_bytes = keys::decrypt_seed_with_identity(&store, &cfg.identity_path)?;
     let mut seed = SeedKeeper::locked();
-    if store.has_seed() && !store.is_encrypted() {
-        if let Some(identity_path) = &cfg.age_identity {
-            match keys::decrypt_seed_with_identity(&store, identity_path) {
-                Ok(Some(s)) => {
-                    seed.set(s);
-                    info!("auto-unlocked wallet seed at startup");
-                }
-                Ok(None) => warn!("keys.toml has no mnemonic"),
-                Err(e) => warn!("could not decrypt seed at startup: {e}"),
-            }
-        } else {
-            warn!("no age identity configured; OTP sending will fail");
-        }
-    } else if store.is_encrypted() {
-        warn!("wallet is passphrase-encrypted; manual unlock not yet implemented");
+    seed.set(seed_bytes);
+
+    let account_id = ensure_account(&mut db_data, &cfg, &seed, &store).await?;
+    let account_ufvk = binding::account_ufvk_encoded(cfg.network, &db_data, account_id)?;
+    let seed_for_check = seed
+        .clone_seed()
+        .ok_or_else(|| anyhow::anyhow!("service seed disappeared during startup"))?;
+    let seed_ufvk = binding::seed_ufvk_encoded(cfg.network, &seed_for_check)?;
+    if seed_ufvk != account_ufvk {
+        anyhow::bail!(
+            "zfa.toml mnemonic does not derive the UFVK in the wallet database; \
+             refusing to operate with mismatched wallet state"
+        );
     }
 
-    let account_id = match ensure_account(&mut db_data, &cfg, &seed, &store).await {
-        Ok(id) => Some(id),
-        Err(e) => {
-            warn!("could not resolve wallet account: {e}");
-            None
-        }
-    };
-
-    let ufvk = account_id
-        .and_then(|id| db_data.get_account(id).ok().flatten().and_then(|a| a.ufvk().cloned()));
+    // Derive the OTP HMAC key from the seed.
+    let otp_key = seed
+        .derive_otp_key()
+        .ok_or_else(|| anyhow::anyhow!("service seed disappeared during OTP key derivation"))?;
 
     let prover = tokio::task::spawn_blocking(LocalTxProver::bundled)
         .await
@@ -110,7 +106,6 @@ pub async fn build(cfg: ActorConfig) -> anyhow::Result<WalletActor> {
         db_cache,
         seed,
         account_id,
-        ufvk,
         prover,
         lwd_url: cfg.lwd_url,
         client: None,
@@ -118,7 +113,8 @@ pub async fn build(cfg: ActorConfig) -> anyhow::Result<WalletActor> {
         backoff: Backoff::new(cfg.reconnect_base, cfg.reconnect_max),
         sync_interval: cfg.sync_interval,
         connect_timeout: cfg.connect_timeout,
-        zfa_db_path: cfg.zfa_db_path,
+        otp_secret: OtpSecret::new(otp_key),
+        response_ledger_path: cfg.response_ledger_path,
         shutdown: cfg.shutdown,
     })
 }
@@ -130,6 +126,9 @@ async fn ensure_account(
     store: &WalletStore,
 ) -> anyhow::Result<zcash_client_sqlite::AccountUuid> {
     let ids = db.get_account_ids()?;
+    if ids.len() > 1 {
+        anyhow::bail!("the ZFA worker requires exactly one wallet account");
+    }
     if let Some(id) = ids.first().copied() {
         return Ok(id);
     }
@@ -140,15 +139,15 @@ async fn ensure_account(
         ));
     };
 
-    let birthday_height = store.birthday;
-    let prior = u32::from(birthday_height).saturating_sub(1).max(1);
+    // `store.birthday` is the tree-state height (the block before the actual
+    // birthday), as written by `init_wallet` which fetches tree state at this
+    // height. We must do the same — not subtract 1.
+    let prior = u32::from(store.birthday);
 
-    let mut client = tokio::time::timeout(
-        Duration::from_secs(30),
-        LwdClient::connect(&cfg.lwd_url),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("timed out connecting for bootstrap"))??;
+    let mut client =
+        tokio::time::timeout(Duration::from_secs(30), LwdClient::connect(&cfg.lwd_url))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out connecting for bootstrap"))??;
 
     let tree_state = tokio::time::timeout(
         Duration::from_secs(30),
@@ -157,15 +156,16 @@ async fn ensure_account(
     .await
     .map_err(|_| anyhow::anyhow!("timed out fetching tree state"))??;
 
-    let birthday = zcash_client_backend::data_api::AccountBirthday::from_treestate(tree_state, None)
-        .map_err(|_| anyhow::anyhow!("failed to derive birthday from tree state"))?;
+    let birthday =
+        zcash_client_backend::data_api::AccountBirthday::from_treestate(tree_state, None)
+            .map_err(|_| anyhow::anyhow!("failed to derive birthday from tree state"))?;
 
     let (id, _usk) = db
-        .create_account("primary", &seed_bytes, &birthday, None)
+        .create_account(crate::config::ACCOUNT_NAME, &seed_bytes, &birthday, None)
         .map_err(|e| anyhow::anyhow!("creating wallet account from seed: {e}"))?;
     info!(
         "bootstrapped wallet account from seed at birthday {}",
-        u32::from(birthday_height)
+        u32::from(store.birthday)
     );
     Ok(id)
 }
@@ -176,8 +176,7 @@ pub struct WalletActor {
     db_data: WriteDb,
     db_cache: FsBlockDb,
     seed: SeedKeeper,
-    account_id: Option<zcash_client_sqlite::AccountUuid>,
-    ufvk: Option<zcash_keys::keys::UnifiedFullViewingKey>,
+    account_id: zcash_client_sqlite::AccountUuid,
     prover: LocalTxProver,
     lwd_url: String,
     client: Option<LwdClient>,
@@ -185,7 +184,8 @@ pub struct WalletActor {
     backoff: Backoff,
     sync_interval: Duration,
     connect_timeout: Duration,
-    zfa_db_path: PathBuf,
+    otp_secret: OtpSecret,
+    response_ledger_path: PathBuf,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -211,7 +211,15 @@ impl WalletActor {
 
             if self.client.is_none() {
                 match self.connect().await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if let Err(e) = self.refresh_tip().await {
+                            let delay = self.backoff.next_delay();
+                            warn!("[zfa] tip refresh after reconnect failed: {e}");
+                            self.client = None;
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                    }
                     Err(e) => {
                         let delay = self.backoff.next_delay();
                         warn!("[zfa] reconnect failed: {e}; retrying in {delay:?}");
@@ -226,9 +234,12 @@ impl WalletActor {
                 if *self.shutdown.borrow() {
                     return;
                 }
+                let Some(client) = self.client.as_mut() else {
+                    break;
+                };
                 match sync_engine::sync_one_batch(
                     "zfa",
-                    self.client.as_mut().unwrap(),
+                    client,
                     &self.network,
                     &self.wallet_dir,
                     &mut self.db_cache,
@@ -253,18 +264,24 @@ impl WalletActor {
                 continue; // reconnect
             }
 
-            // Open zfa.db for session writes.
-            let mut zfa_db = match session::init_db(&self.zfa_db_path) {
+            // The response ledger is worker-local idempotence state, not a
+            // consumer application's session store.
+            let mut response_ledger = match response_ledger::init_db(&self.response_ledger_path) {
                 Ok(db) => db,
                 Err(e) => {
-                    error!("[zfa] failed to open zfa.db: {e}");
+                    error!("[zfa] failed to open response ledger: {e}");
                     tokio::time::sleep(self.sync_interval).await;
                     continue;
                 }
             };
+            self.rebroadcast_pending_responses(&mut response_ledger)
+                .await;
 
             // Open the mempool stream.
-            let stream = match self.client.as_mut().unwrap().get_mempool_stream().await {
+            let Some(client) = self.client.as_mut() else {
+                continue;
+            };
+            let stream = match client.get_mempool_stream().await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!("[zfa] failed to open mempool stream: {e}");
@@ -286,7 +303,7 @@ impl WalletActor {
                     msg = stream.message() => {
                         match msg {
                             Ok(Some(raw_tx)) => {
-                                self.process_mempool_tx(&mut zfa_db, raw_tx).await;
+                                self.process_mempool_tx(&mut response_ledger, raw_tx).await;
                             }
                             Ok(None) => {
                                 info!("[zfa] mempool stream closed (new block)");
@@ -314,12 +331,9 @@ impl WalletActor {
 
     async fn connect(&mut self) -> anyhow::Result<()> {
         info!("[zfa] connecting to lightwalletd: {}", self.lwd_url);
-        let client = tokio::time::timeout(
-            self.connect_timeout,
-            LwdClient::connect(&self.lwd_url),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("connect timed out after {:?}", self.connect_timeout))??;
+        let client = tokio::time::timeout(self.connect_timeout, LwdClient::connect(&self.lwd_url))
+            .await
+            .map_err(|_| anyhow::anyhow!("connect timed out after {:?}", self.connect_timeout))??;
         self.client = Some(client);
         self.backoff.reset();
         Ok(())
@@ -331,7 +345,8 @@ impl WalletActor {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("not connected"))?;
         let tip = client.get_latest_block().await?;
-        let height = tip.height as u32;
+        let height = u32::try_from(tip.height)
+            .map_err(|_| anyhow::anyhow!("lightwalletd returned an out-of-range chain height"))?;
         if self.tip_height != Some(height) {
             self.tip_height = Some(height);
             self.db_data
@@ -341,20 +356,27 @@ impl WalletActor {
         Ok(())
     }
 
-    /// Process one mempool transaction: parse → decrypt → extract memo → authenticate → OTP.
+    /// Process one unmined transaction from `GetMempoolStream`.
+    ///
+    /// The stream's `RawTransaction.height` is intentionally ignored. The
+    /// lightwalletd proto convention is zero while Zaino currently reports the
+    /// best-tip height, but both values describe a mempool event. The pinned
+    /// `zcash_client_backend::decrypt_transaction` API expects `None` plus the
+    /// current tip for this case and handles Sapling, Orchard, and Ironwood.
     async fn process_mempool_tx(
         &mut self,
-        zfa_db: &mut rusqlite::Connection,
+        response_ledger: &mut rusqlite::Connection,
         raw_tx: zcash_client_backend::proto::service::RawTransaction,
     ) {
-        let tip = self.tip_height.unwrap_or(0);
-
-        let branch_height = if raw_tx.height == 0 || raw_tx.height > tip as u64 {
-            BlockHeight::from_u32(tip + 1)
-        } else {
-            BlockHeight::from_u32(raw_tx.height as u32)
+        let Some(tip) = self.tip_height else {
+            warn!("[zfa] cannot decrypt mempool transaction before learning the chain tip");
+            return;
         };
-        let branch_id = BranchId::for_height(&self.network, branch_height);
+        let Some(mempool_height) = tip.checked_add(1) else {
+            error!("[zfa] chain tip cannot be incremented for mempool decryption");
+            return;
+        };
+        let branch_id = BranchId::for_height(&self.network, BlockHeight::from_u32(mempool_height));
 
         let tx = match Transaction::read(&raw_tx.data[..], branch_id) {
             Ok(tx) => tx,
@@ -364,98 +386,139 @@ impl WalletActor {
             }
         };
 
-        let txid = tx.txid();
-        let txid_hex = txid.to_string();
-
-        let mined_height = if raw_tx.height == 0 || raw_tx.height > tip as u64 {
-            None
-        } else {
-            Some(BlockHeight::from_u32(raw_tx.height as u32))
+        let payments = match self.decrypt_and_store_mempool_tx(&tx, BlockHeight::from_u32(tip)) {
+            Ok(payments) => payments,
+            Err(e) => {
+                tracing::debug!("[zfa] trial decryption/store failed: {e}");
+                return;
+            }
         };
 
-        // Trial-decrypt and store.
-        if let Err(e) = decrypt_and_store_transaction(
-            &self.network,
-            &mut self.db_data,
-            &tx,
-            mined_height,
-        ) {
-            tracing::debug!("[zfa] decrypt_and_store failed for tx {txid_hex}: {e}");
-            return;
-        }
+        for payment in payments {
+            if payment.amount_zats < MIN_AUTH_PAYMENT {
+                tracing::debug!(
+                    txid = %payment.incoming_txid,
+                    amount_zats = payment.amount_zats,
+                    "[zfa] ignored auth request below the minimum payment"
+                );
+                continue;
+            }
 
-        // Check if we received a shielded output with a ZFA session memo.
-        if let Some(session_id) = self.extract_session_id(&txid) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+            if let Err(e) = self.parse_return_address(&payment.return_address) {
+                tracing::debug!(txid = %payment.incoming_txid, "[zfa] ignored invalid return address: {e}");
+                continue;
+            }
 
-            match session::authenticate_session(zfa_db, &session_id, &txid_hex, "", now) {
-                Ok(true) => {
-                    info!("[zfa] session {session_id} authenticated (txid {txid_hex})");
-
-                    // Check if we need to send an OTP response.
-                    if let Ok(Some(status)) = session::session_status(zfa_db, &session_id) {
-                        if status.otp_status.as_deref() != Some("sent") {
-                            if let Some(user_addr) = status.user_address {
-                                // Generate OTP and send response transaction.
-                                let otp_secret = session_id.as_bytes();
-                                let nonce = &txid.as_ref()[..8];
-                                let otp_code = otp::generate_otp(otp_secret, &session_id, nonce);
-
-                                match self.send_otp_response(&user_addr, &otp_code).await {
-                                    Ok(resp_txid) => {
-                                        info!(
-                                            "[zfa] OTP response sent to {user_addr} \
-                                             (otp={otp_code}, txid={resp_txid})"
-                                        );
-                                        let _ = session::set_otp_sent(
-                                            zfa_db,
-                                            &session_id,
-                                            &otp_code,
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!("[zfa] OTP response send failed: {e}");
-                                    }
-                                }
-                            }
+            let incoming_txid = payment.incoming_txid.to_string();
+            match response_ledger::claim(response_ledger, &incoming_txid) {
+                Ok(Claim::Acquired) => {
+                    let otp_code = otp::generate_otp(
+                        self.otp_secret.expose(),
+                        &payment.session_id,
+                        &payment.return_address,
+                    );
+                    let response_txid = match self
+                        .create_otp_response(&payment.return_address, &otp_code)
+                    {
+                        Ok(txid) => txid,
+                        Err(e) => {
+                            warn!(
+                                txid = %incoming_txid,
+                                "[zfa] response claimed but wallet transaction creation failed: {e}"
+                            );
+                            continue;
                         }
+                    };
+
+                    if let Err(e) = response_ledger::record_created(
+                        response_ledger,
+                        &incoming_txid,
+                        &response_txid,
+                    ) {
+                        error!(
+                            txid = %incoming_txid,
+                            response_txid = %response_txid,
+                            "[zfa] wallet created a response but the ledger was not updated: {e}"
+                        );
+                        continue;
                     }
+
+                    self.broadcast_and_record(response_ledger, &incoming_txid, response_txid)
+                        .await;
                 }
-                Ok(false) => tracing::debug!(
-                    "[zfa] session {session_id} not authenticated (duplicate/expired/wrong status)"
-                ),
-                Err(e) => warn!("[zfa] failed to authenticate session {session_id}: {e}"),
+                Ok(Claim::AlreadyHandled(ResponseState::Created { response_txid })) => {
+                    self.broadcast_and_record(response_ledger, &incoming_txid, response_txid)
+                        .await;
+                }
+                Ok(Claim::AlreadyHandled(ResponseState::Broadcast { .. })) => {
+                    tracing::debug!(txid = %incoming_txid, "[zfa] duplicate auth transaction ignored");
+                }
+                Ok(Claim::AlreadyHandled(ResponseState::Claimed)) => {
+                    error!(
+                        txid = %incoming_txid,
+                        "[zfa] response is claimed without a recorded transaction; refusing a second spend"
+                    );
+                }
+                Err(e) => {
+                    warn!(txid = %incoming_txid, "[zfa] failed to claim response: {e}");
+                }
             }
         }
     }
 
-    /// Send an OTP response transaction to the user's address with the OTP code in the memo.
-    async fn send_otp_response(
+    /// Trial-decrypt and persist one mempool transaction using the public
+    /// librustzcash API, then retain only authentic incoming payment events.
+    fn decrypt_and_store_mempool_tx(
+        &mut self,
+        tx: &Transaction,
+        chain_tip: BlockHeight,
+    ) -> anyhow::Result<Vec<IncomingAuthPayment>> {
+        let ufvks = self.db_data.get_unified_full_viewing_keys()?;
+        let decrypted = decrypt_transaction(&self.network, None, Some(chain_tip), tx, &ufvks);
+        let mut payments = Vec::new();
+
+        collect_incoming_from_pool(
+            decrypted.sapling_outputs(),
+            |note| note.value().inner(),
+            tx.txid(),
+            &mut payments,
+        );
+        collect_incoming_from_pool(
+            decrypted.orchard_outputs(),
+            |note_and_pool| note_and_pool.0.value().inner(),
+            tx.txid(),
+            &mut payments,
+        );
+        collect_incoming_from_pool(
+            decrypted.ironwood_outputs(),
+            |note_and_pool| note_and_pool.0.value().inner(),
+            tx.txid(),
+            &mut payments,
+        );
+
+        self.db_data.store_decrypted_tx(decrypted)?;
+        Ok(payments)
+    }
+
+    /// Construct and persist, but do not yet broadcast, one OTP response.
+    fn create_otp_response(
         &mut self,
         recipient_address: &str,
         otp_code: &str,
-    ) -> anyhow::Result<String> {
-        info!("[zfa] building OTP response tx to {} with OTP {}", recipient_address, otp_code);
-        let account_id = self.account_id.ok_or_else(|| anyhow::anyhow!("no account"))?;
-        
-        let zaddr = zcash_address::ZcashAddress::try_from_encoded(recipient_address)
-            .map_err(|e| anyhow::anyhow!("invalid recipient address: {e}"))?;
-            
+    ) -> anyhow::Result<TxId> {
+        let account_id = self.account_id;
+        let zaddr = self.parse_return_address(recipient_address)?;
+
         let memo_str = format!("(ZFA OTP){otp_code}");
         let mut memo_bytes = [0u8; 512];
-        let bytes = memo_str.as_bytes();
-        let len = bytes.len().min(512);
-        memo_bytes[..len].copy_from_slice(&bytes[..len]);
+        memo_bytes[..memo_str.len()].copy_from_slice(memo_str.as_bytes());
         let memo = zcash_protocol::memo::MemoBytes::from_bytes(&memo_bytes)
             .map_err(|e| anyhow::anyhow!("invalid memo: {e}"))?;
 
         let payment = zip321::Payment::new(
             zaddr,
             Some(
-                zcash_protocol::value::Zatoshis::from_u64(1_000)
+                zcash_protocol::value::Zatoshis::from_u64(OTP_RESPONSE_AMOUNT)
                     .map_err(|e| anyhow::anyhow!("invalid amount: {e}"))?,
             ),
             Some(memo),
@@ -464,12 +527,14 @@ impl WalletActor {
             vec![],
         )
         .map_err(|e| anyhow::anyhow!("invalid payment: {e}"))?;
-        
+
         let request = zip321::TransactionRequest::new(vec![payment])
             .map_err(|e| anyhow::anyhow!("invalid transaction request: {e}"))?;
 
-        let usk = self.seed.derive_usk(self.network, zip32::AccountId::try_from(0u32).unwrap())?;
-        
+        let account_index = zip32::AccountId::try_from(crate::config::ACCOUNT_INDEX)
+            .map_err(|_| anyhow::anyhow!("account {} is not a valid ZIP-32 account", crate::config::ACCOUNT_INDEX))?;
+        let usk = self.seed.derive_usk(self.network, account_index)?;
+
         let txids = do_send_otp_response(
             &mut self.db_data,
             &self.network,
@@ -478,27 +543,78 @@ impl WalletActor {
             &usk,
             &self.prover,
         )?;
-        
-        if txids.is_empty() {
-            return Err(anyhow::anyhow!("no txids created"));
+
+        if txids.len() != 1 {
+            return Err(anyhow::anyhow!(
+                "expected one OTP response transaction, created {}",
+                txids.len()
+            ));
         }
-        let txid = txids[0];
-        
-        // Broadcast
-        use zcash_client_backend::data_api::WalletRead;
-        let tx_data = self.db_data
+        Ok(txids[0])
+    }
+
+    async fn broadcast_and_record(
+        &mut self,
+        response_ledger: &mut rusqlite::Connection,
+        incoming_txid: &str,
+        response_txid: TxId,
+    ) {
+        match self.broadcast_response(response_txid).await {
+            Ok(()) => {
+                if let Err(e) = response_ledger::record_broadcast(
+                    response_ledger,
+                    incoming_txid,
+                    &response_txid,
+                ) {
+                    error!(
+                        txid = %incoming_txid,
+                        response_txid = %response_txid,
+                        "[zfa] response was broadcast but ledger update failed: {e}"
+                    );
+                }
+            }
+            Err(e) => warn!(
+                txid = %incoming_txid,
+                response_txid = %response_txid,
+                "[zfa] response broadcast failed; the recorded transaction may be retried: {e}"
+            ),
+        }
+    }
+
+    /// Retry every persisted-but-unacknowledged response before opening the
+    /// next mempool stream. This is safe because these are the exact wallet
+    /// transactions recorded before their original broadcast attempt.
+    async fn rebroadcast_pending_responses(&mut self, response_ledger: &mut rusqlite::Connection) {
+        let pending = match response_ledger::pending_broadcasts(response_ledger) {
+            Ok(pending) => pending,
+            Err(e) => {
+                error!("[zfa] could not read pending OTP responses from the ledger: {e}");
+                return;
+            }
+        };
+        for pending in pending {
+            self.broadcast_and_record(
+                response_ledger,
+                &pending.incoming_txid,
+                pending.response_txid,
+            )
+            .await;
+        }
+    }
+
+    /// Broadcast a wallet transaction that was already durably created.
+    async fn broadcast_response(&mut self, txid: TxId) -> anyhow::Result<()> {
+        let tx_data = self
+            .db_data
             .get_transaction(txid)
             .map_err(|e| anyhow::anyhow!("getting transaction: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("transaction not found after creation"))?;
-            
+
         let mut buf = Vec::new();
         use zcash_primitives::transaction::Transaction as TxTrait;
         TxTrait::write(&tx_data, &mut buf)
             .map_err(|e| anyhow::anyhow!("serializing transaction: {e}"))?;
-            
-        let txid_hex = txid.to_string();
-        info!("[zfa] broadcasting OTP response tx {}", txid_hex);
-        
+
         let (error_code, error_message) = self
             .client
             .as_mut()
@@ -512,45 +628,57 @@ impl WalletActor {
             ));
         }
 
-        Ok(txid_hex)
+        Ok(())
     }
 
-
-    /// Query the wallet DB for a memo matching this txid, and try to parse it
-    /// as a ZFA session memo.
-    fn extract_session_id(&self, txid: &TxId) -> Option<String> {
-        let conn = rusqlite::Connection::open(open::data_db_path(&self.wallet_dir)).ok()?;
-
-        // txid in the DB is stored in internal/protocol byte order.
-        let mut internal = txid.as_ref().to_vec();
-        internal.reverse();
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT memo FROM orchard_received_notes orn
-                 JOIN transactions t ON t.id_tx = orn.transaction_id
-                 WHERE t.txid = ?1 AND orn.memo IS NOT NULL",
-            )
-            .ok()?;
-
-        let rows = stmt
-            .query_map(rusqlite::params![internal], |row| {
-                let memo: Vec<u8> = row.get(0)?;
-                Ok(memo)
-            })
-            .ok()?;
-
-        for row in rows {
-            if let Ok(memo_bytes) = row {
-                if memo_bytes.len() == 512 {
-                    let memo_array: [u8; 512] = memo_bytes[..512].try_into().ok()?;
-                    if let Some(parsed) = memo::parse_memo(&memo_array) {
-                        return Some(parsed.session_id);
-                    }
-                }
-            }
+    /// Parse an exact return-address string and require a shielded receiver on
+    /// this worker's network. `ZcashAddress::convert_if_network` is the
+    /// upstream network validation boundary; `Payment::new` then enforces that
+    /// the selected recipient can carry a memo.
+    fn parse_return_address(&self, encoded: &str) -> anyhow::Result<zcash_address::ZcashAddress> {
+        let address = zcash_address::ZcashAddress::try_from_encoded(encoded)
+            .map_err(|e| anyhow::anyhow!("invalid return address: {e}"))?;
+        if !address.can_receive_memo() {
+            anyhow::bail!("return address has no shielded receiver for the OTP memo");
         }
-        None
+        address
+            .clone()
+            .convert_if_network::<zcash_keys::address::Address>(self.network.network_type())
+            .map_err(|e| anyhow::anyhow!("return address is for another network: {e}"))?;
+        Ok(address)
+    }
+}
+
+/// Typed data retained from one incoming decrypted shielded note.
+struct IncomingAuthPayment {
+    incoming_txid: TxId,
+    session_id: String,
+    return_address: String,
+    amount_zats: u64,
+}
+
+fn collect_incoming_from_pool<Note>(
+    outputs: &[DecryptedOutput<Note, zcash_client_sqlite::AccountUuid>],
+    note_value: impl Fn(&Note) -> u64,
+    incoming_txid: TxId,
+    payments: &mut Vec<IncomingAuthPayment>,
+) {
+    for output in outputs {
+        if output.transfer_type() != TransferType::Incoming {
+            continue;
+        }
+        let Some(parsed) = memo::parse_memo(output.memo().as_array()) else {
+            continue;
+        };
+        let Some(return_address) = parsed.return_address else {
+            continue;
+        };
+        payments.push(IncomingAuthPayment {
+            incoming_txid,
+            session_id: parsed.session_id,
+            return_address,
+            amount_zats: note_value(output.note()),
+        });
     }
 }
 fn do_send_otp_response(
@@ -558,21 +686,22 @@ fn do_send_otp_response(
     net: &ZNetwork,
     account_id: zcash_client_sqlite::AccountUuid,
     request: zip321::TransactionRequest,
-    usk: &zcash_keys::keys::UnifiedSpendingKey,
+    usk: &UnifiedSpendingKey,
     prover: &zcash_proofs::prover::LocalTxProver,
 ) -> anyhow::Result<Vec<TxId>> {
-    let change_strategy = zcash_client_backend::fees::standard::MultiOutputChangeStrategy::new(
-        zcash_client_backend::fees::StandardFeeRule::Zip317,
+    let target_note_count = NonZeroUsize::new(TARGET_NOTE_COUNT)
+        .ok_or_else(|| anyhow::anyhow!("target note count must be nonzero"))?;
+    let min_split_output = Zatoshis::from_u64(MIN_SPLIT_OUTPUT_VALUE)
+        .map_err(|e| anyhow::anyhow!("invalid minimum split-output value: {e}"))?;
+    let change_strategy = MultiOutputChangeStrategy::new(
+        StandardFeeRule::Zip317,
         None,
         zcash_protocol::ShieldedPool::Orchard,
-        zcash_client_backend::fees::DustOutputPolicy::default(),
-        zcash_client_backend::fees::SplitPolicy::with_min_output_value(
-            std::num::NonZeroUsize::new(4).unwrap(),
-            zcash_protocol::value::Zatoshis::from_u64(10_000_000).unwrap(),
-        ),
+        DustOutputPolicy::default(),
+        SplitPolicy::with_min_output_value(target_note_count, min_split_output),
     );
-    let input_selector = zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelector::new();
-    let policy = zcash_client_backend::data_api::wallet::ConfirmationsPolicy::default();
+    let input_selector = GreedyInputSelector::new();
+    let policy = ConfirmationsPolicy::default();
 
     let proposal = zcash_client_backend::data_api::wallet::propose_transfer(
         db,
@@ -582,19 +711,39 @@ fn do_send_otp_response(
         &change_strategy,
         request,
         policy,
-        &zcash_client_backend::data_api::wallet::input_selection::SpendPolicy::default(),
+        &SpendPolicy::default(),
         None,
-    ).map_err(|e: zcash_client_backend::data_api::error::Error<_, zcash_client_sqlite::wallet::commitment_tree::Error, _, _, _, _>| anyhow::anyhow!("propose error: {:?}", e))?;
+    )
+    .map_err(
+        |e: zcash_client_backend::data_api::error::Error<
+            _,
+            zcash_client_sqlite::wallet::commitment_tree::Error,
+            _,
+            _,
+            _,
+            _,
+        >| anyhow::anyhow!("propose error: {:?}", e),
+    )?;
 
     let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions(
         db,
         net,
         prover,
         prover,
-        &zcash_client_backend::data_api::wallet::SpendingKeys::from_unified_spending_key(usk.clone()),
-        zcash_client_backend::wallet::OvkPolicy::Sender,
+        &SpendingKeys::from_unified_spending_key(usk.clone()),
+        OvkPolicy::Sender,
         &proposal,
-    ).map_err(|e: zcash_client_backend::data_api::error::Error<_, _, zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError, _, zcash_primitives::transaction::fees::zip317::FeeError, _>| anyhow::anyhow!("create error: {:?}", e))?;
+    )
+    .map_err(
+        |e: zcash_client_backend::data_api::error::Error<
+            _,
+            _,
+            zcash_client_backend::data_api::wallet::input_selection::GreedyInputSelectorError,
+            _,
+            zcash_primitives::transaction::fees::zip317::FeeError,
+            _,
+        >| anyhow::anyhow!("create error: {:?}", e),
+    )?;
 
     Ok(txids.into())
 }

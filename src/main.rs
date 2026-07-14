@@ -10,13 +10,14 @@ async fn main() -> anyhow::Result<()> {
     // Handle init subcommand before resolving full config.
     if let Some(Command::Init(args)) = &cli.command {
         let config = AppConfig::resolve(&cli)?;
-        zfa_backend::config::init_tracing(&config.log);
+        zfa_backend::config::init_tracing();
         zfa_backend::hardening::harden_process();
+        let _datadir_lock = zfa_backend::lock::lock_datadir(&config.datadir)?;
         return zfa_backend::init_wallet(&config, args).await;
     }
 
     let config = AppConfig::resolve(&cli)?;
-    zfa_backend::config::init_tracing(&config.log);
+    zfa_backend::config::init_tracing();
     zfa_backend::hardening::harden_process();
 
     let _datadir_lock = zfa_backend::lock::lock_datadir(&config.datadir)?;

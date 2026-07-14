@@ -1,10 +1,10 @@
 //! In-memory custody of the decrypted wallet seed and on-demand spending-key
 //! derivation.
 //!
-//! Ported from zecd's `wallet/keys.rs`, adapted for ZFA (no RpcError, simpler
-//! error handling). The seed is held as a zeroizing secret in mlock'd memory
-//! and never persisted in the clear. The Unified Spending Key is derived fresh
-//! per operation and never cached.
+//! The seed is held as a zeroizing secret in mlock'd memory and never
+//! persisted in the clear. The Unified Spending Key is derived fresh per
+//! operation and never cached. The OTP HMAC key is derived from the seed and
+//! held the same way.
 
 use std::path::Path;
 
@@ -17,15 +17,15 @@ use crate::wallet::store::WalletStore;
 
 /// The decrypted seed held in mlock'd memory: pinned into RAM (best-effort)
 /// so it is never written to swap, and zeroized + munlocked on drop.
-struct MlockedSeed {
+struct MlockedSecret {
     seed: SecretVec<u8>,
     locked: bool,
 }
 
-impl MlockedSeed {
+impl MlockedSecret {
     fn new(seed: SecretVec<u8>) -> Self {
         let locked = hardening::lock_secret(seed.expose_secret());
-        MlockedSeed { seed, locked }
+        MlockedSecret { seed, locked }
     }
 
     fn expose(&self) -> &[u8] {
@@ -33,7 +33,7 @@ impl MlockedSeed {
     }
 }
 
-impl Drop for MlockedSeed {
+impl Drop for MlockedSecret {
     fn drop(&mut self) {
         hardening::unlock_secret(self.seed.expose_secret(), self.locked);
     }
@@ -43,7 +43,7 @@ impl Drop for MlockedSeed {
 /// requires this to be unlocked.
 #[derive(Default)]
 pub struct SeedKeeper {
-    seed: Option<MlockedSeed>,
+    seed: Option<MlockedSecret>,
 }
 
 impl SeedKeeper {
@@ -56,7 +56,7 @@ impl SeedKeeper {
     }
 
     pub fn set(&mut self, seed: SecretVec<u8>) {
-        self.seed = Some(MlockedSeed::new(seed));
+        self.seed = Some(MlockedSecret::new(seed));
     }
 
     pub fn is_unlocked(&self) -> bool {
@@ -64,9 +64,11 @@ impl SeedKeeper {
     }
 
     /// A copy of the decrypted seed, if loaded — for recreating the wallet
-    /// account from keys.toml on an empty datadir.
+    /// account from `zfa.toml` on an empty datadir.
     pub fn clone_seed(&self) -> Option<SecretVec<u8>> {
-        self.seed.as_ref().map(|s| SecretVec::new(s.expose().to_vec()))
+        self.seed
+            .as_ref()
+            .map(|s| SecretVec::new(s.expose().to_vec()))
     }
 
     /// Derive the Unified Spending Key for an account index, or an error if the
@@ -82,6 +84,32 @@ impl SeedKeeper {
             .ok_or_else(|| anyhow::anyhow!("wallet is locked — seed not loaded"))?;
         UnifiedSpendingKey::from_seed(&network, seed.expose(), account_index)
             .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))
+    }
+
+    /// Derive the 32-byte OTP HMAC key from the seed.
+    pub fn derive_otp_key(&self) -> Option<SecretVec<u8>> {
+        self.seed
+            .as_ref()
+            .map(|s| crate::config::derive_otp_key(s.expose()))
+    }
+}
+
+/// The HMAC key shared with consumer application servers. Like the wallet
+/// seed, it is zeroized by `SecretVec` and best-effort mlocked for its full
+/// in-process lifetime. It has no `Debug` or `Display` implementation.
+pub struct OtpSecret {
+    secret: MlockedSecret,
+}
+
+impl OtpSecret {
+    pub fn new(secret: SecretVec<u8>) -> Self {
+        OtpSecret {
+            secret: MlockedSecret::new(secret),
+        }
+    }
+
+    pub fn expose(&self) -> &[u8] {
+        self.secret.expose()
     }
 }
 
@@ -105,7 +133,7 @@ pub fn check_identity_file_permissions(identity_path: &Path) -> anyhow::Result<(
         let mode = meta.permissions().mode();
         if mode & 0o077 != 0 {
             anyhow::bail!(
-                "age identity file {} has insecure permissions {mode:#o}: it must be \
+                "age identity file {path} has insecure permissions {mode:#o}: it must be \
                  readable only by its owner (try chmod 600)",
                 path = identity_path.display(),
                 mode = mode & 0o7777,
@@ -121,7 +149,7 @@ pub fn check_identity_file_permissions(identity_path: &Path) -> anyhow::Result<(
 pub fn decrypt_seed_with_identity(
     store: &WalletStore,
     identity_path: &Path,
-) -> anyhow::Result<Option<SecretVec<u8>>> {
+) -> anyhow::Result<SecretVec<u8>> {
     check_identity_file_permissions(identity_path)?;
     let identities = age::IdentityFile::from_file(identity_path.to_string_lossy().into_owned())?
         .into_identities()?;
