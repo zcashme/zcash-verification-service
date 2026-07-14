@@ -18,11 +18,11 @@
 use anyhow::Context;
 use tracing::info;
 
+use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 use zcash_client_backend::proto::service::{
     BlockId, BlockRange, ChainSpec, Empty, RawTransaction, TreeState,
 };
-use zcash_client_backend::proto::compact_formats::CompactBlock;
 
 /// A connected lightwalletd gRPC client.
 ///
@@ -60,7 +60,10 @@ impl LwdClient {
     pub async fn get_tree_state(&mut self, height: u64) -> anyhow::Result<TreeState> {
         let resp = self
             .inner
-            .get_tree_state(BlockId { height, hash: vec![] })
+            .get_tree_state(BlockId {
+                height,
+                hash: vec![],
+            })
             .await
             .context("GetTreeState failed")?;
         Ok(resp.into_inner())
@@ -103,8 +106,14 @@ impl LwdClient {
         let resp = self
             .inner
             .get_block_range(BlockRange {
-                start: Some(BlockId { height: start, hash: vec![] }),
-                end: Some(BlockId { height: end, hash: vec![] }),
+                start: Some(BlockId {
+                    height: start,
+                    hash: vec![],
+                }),
+                end: Some(BlockId {
+                    height: end,
+                    hash: vec![],
+                }),
                 pool_types: vec![],
             })
             .await

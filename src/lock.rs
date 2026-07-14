@@ -1,27 +1,19 @@
 //! Single-instance guard for the data directory.
 //!
-//! Two zecd processes writing one data directory would both open the same `WalletDb` files and
+//! Two ZFA workers writing one data directory would both open the same `WalletDb` files and
 //! step on each other's writes (the single-writer-actor invariant only serializes writers
-//! *within* one process). To prevent that, every datadir-*writing* entry point - the daemon
-//! ([`crate::daemon::run`]) and `zecd init` ([`crate::init::run`]) - takes an exclusive advisory
-//! lock on `<datadir>/.lock` first and holds it for as long as it owns the datadir (the process
-//! lifetime for the daemon). This mirrors zallet's `lock_datadir` (and zcashd before it): the
+//! *within* one process). To prevent that, both the worker and `zfa-backend init` take an
+//! exclusive advisory lock on `<datadir>/.lock` first and hold it for the lifetime of the
+//! operation. This mirrors zallet's `lock_datadir` (and zcashd before it): the
 //! lockfile is an empty marker, the OS advisory file lock is the real mutex, and a second writer
 //! finds the lock already held and refuses to start.
-//!
-//! Two commands are deliberately *not* locked, because neither writes the datadir:
-//! - `rpcauth` - a pure credential generator that never touches the datadir (dispatched before
-//!   config is even resolved).
-//! - `export-ufvk` - reads the wallet DB read-only (short-lived connection, WAL), so it is safe
-//!   to run while the daemon holds the datadir; locking it would needlessly refuse a UFVK export
-//!   from a live wallet.
 //!
 //! # Limitation: the lock is host-local
 //!
 //! The advisory file lock is enforced by the *local* kernel, so it only guards against a second
-//! zecd on the **same host**. It does **not** span hosts: on a network filesystem (NFS, SMB, a
+//! worker on the **same host**. It does **not** span hosts: on a network filesystem (NFS, SMB, a
 //! Kubernetes `ReadWriteMany` volume) mounted by two machines, each host's kernel grants the lock
-//! independently, so two zecd on different hosts sharing one datadir would both believe they hold
+//! independently, so two workers on different hosts sharing one datadir would both believe they hold
 //! it and then corrupt the wallet DB with concurrent SQLite writers. **The data directory must
 //! therefore be host-local** - a local disk, or a volume mounted so exactly one node can write it
 //! (Kubernetes `ReadWriteOnce`) - and must never be shared read-write across hosts. There is no
@@ -39,7 +31,7 @@ use anyhow::{anyhow, Context as _};
 /// Acquire the exclusive lock on `<datadir>/.lock`, returning a guard that releases it when
 /// dropped. Hold the guard for as long as the datadir is in use (the process lifetime).
 ///
-/// The data directory is created if it does not yet exist: `zecd init` can run before any datadir
+/// The data directory is created if it does not yet exist: `zfa-backend init` can run before any datadir
 /// has been laid down, and the lockfile's parent must exist before it can be created.
 ///
 /// Returns an error if the lock is already held by another process (the "already running" case),
@@ -52,6 +44,7 @@ pub fn lock_datadir(datadir: &Path) -> anyhow::Result<fmutex::Guard<'static>> {
     // lockfile's parent) exists before creating the lockfile.
     fs::create_dir_all(datadir)
         .with_context(|| format!("creating data directory {}", datadir.display()))?;
+    restrict_datadir_permissions(datadir)?;
 
     let lockfile = datadir.join(".lock");
     // Ensure the lockfile exists before we try to lock it (the advisory OS lock on it is what
@@ -67,7 +60,7 @@ pub fn lock_datadir(datadir: &Path) -> anyhow::Result<fmutex::Guard<'static>> {
         .with_context(|| format!("reading lockfile {}", lockfile.display()))?
         .ok_or_else(|| {
             anyhow!(
-                "Cannot lock data directory {}. Another zecd is already running on this host; \
+                "Cannot lock data directory {}. Another ZFA worker is already running on this host; \
                  the lock clears when it exits, so just retry (no lockfile to delete). \
                  Note the lock is host-local: it does NOT protect a datadir shared across hosts \
                  (e.g. a network/ReadWriteMany volume) - keep the datadir host-local.",
@@ -84,6 +77,39 @@ pub fn lock_datadir(datadir: &Path) -> anyhow::Result<fmutex::Guard<'static>> {
     let _ = fs::write(&lockfile, stamp);
 
     Ok(guard)
+}
+
+/// The directory contains `data.sqlite` plus SQLite WAL sidecars, the age
+/// identity, and the response ledger. Restrict directory traversal so a
+/// sidecar created by SQLite cannot expose wallet metadata through a permissive
+/// process umask.
+#[cfg(unix)]
+fn restrict_datadir_permissions(datadir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut permissions = fs::metadata(datadir)
+        .with_context(|| {
+            format!(
+                "reading data directory permissions at {}",
+                datadir.display()
+            )
+        })?
+        .permissions();
+    if permissions.mode() & 0o077 != 0 {
+        permissions.set_mode(0o700);
+        fs::set_permissions(datadir, permissions).with_context(|| {
+            format!(
+                "restricting data directory permissions at {}",
+                datadir.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_datadir_permissions(_datadir: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// Best-effort local hostname for the lockfile diagnostic stamp; `"unknown"` if it can't be read.
@@ -153,7 +179,7 @@ mod tests {
 
     #[test]
     fn lock_creates_the_datadir_if_missing() {
-        // `zecd init` can run before the datadir exists; locking must create it.
+        // `zfa-backend init` can run before the datadir exists; locking must create it.
         let parent = tempfile::tempdir().unwrap();
         let datadir = parent.path().join("not-created-yet");
         assert!(!datadir.exists());

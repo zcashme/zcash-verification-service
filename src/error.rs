@@ -11,7 +11,9 @@ pub struct ZfaError {
 
 impl ZfaError {
     pub fn new(message: impl Into<String>) -> Self {
-        ZfaError { message: message.into() }
+        ZfaError {
+            message: message.into(),
+        }
     }
 }
 

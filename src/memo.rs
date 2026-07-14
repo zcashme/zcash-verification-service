@@ -1,18 +1,15 @@
-//! Strict 512-byte ZFA session memo parser.
+//! Strict 512-byte ZFA authentication memo parser.
 //!
-//! A ZFA authentication transaction carries a memo containing the exact session
-//! ID. The parser extracts the 16-digit session ID from the memo bytes, removing
-//! only trailing NUL padding (never whitespace), and rejecting anything malformed.
+//! A ZFA authentication memo is UTF-8 text followed by NUL padding:
 //!
-//! ## Memo format
+//! ```text
+//! (DO NOT MODIFY){zfa/1234567890123456[,return-address]}
+//! ```
 //!
-//! The memo is the standard Zcash 512-byte memo field. The session ID is a
-//! 16-digit decimal string placed at the start of the memo, padded with NUL
-//! bytes to fill the 512 bytes. The parser:
-//!
-//! 1. Strips trailing NUL bytes (0x00) from the 512-byte memo.
-//! 2. Rejects empty memos, interior NULs, and any content beyond the 16 digits.
-//! 3. Validates that the remaining bytes are exactly 16 ASCII digits (0-9).
+//! This module deliberately validates only the wire-format boundary. The
+//! worker validates an optional return address against its configured Zcash
+//! network immediately before constructing an OTP response; keeping that
+//! operation there preserves the exact encoded address for the HMAC message.
 
 /// The length of a Zcash memo field in bytes.
 pub const MEMO_LEN: usize = 512;
@@ -20,107 +17,116 @@ pub const MEMO_LEN: usize = 512;
 /// The length of a ZFA session ID (16 ASCII digits).
 pub const SESSION_ID_LEN: usize = 16;
 
-/// A parsed ZFA session memo — the 16-digit session ID.
+const PREFIX: &[u8] = b"(DO NOT MODIFY){zfa/";
+
+/// A syntactically valid ZFA authentication memo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMemo {
+    /// Exactly sixteen ASCII decimal digits.
     pub session_id: String,
+    /// The exact encoded return address supplied by the payer, if present.
+    ///
+    /// It is intentionally not normalized: this exact string is an input to
+    /// the OTP HMAC and must match the consumer application's value byte for
+    /// byte.
+    pub return_address: Option<String>,
 }
 
-/// Parse a 512-byte memo, extracting the ZFA session ID.
+/// Parse a full Zcash memo as a ZFA authentication payload.
 ///
-/// Returns `None` if the memo is empty, contains interior NULs, has content
-/// beyond the 16-digit session ID, or contains non-digit characters.
+/// The parser accepts only full 512-byte memo fields, removes trailing NUL
+/// padding, and rejects interior NULs, non-UTF-8 text, prefix/suffix changes,
+/// non-decimal session IDs, empty return addresses, and additional separators.
 pub fn parse_memo(memo: &[u8]) -> Option<ParsedMemo> {
     if memo.len() != MEMO_LEN {
         return None;
     }
 
-    // Strip trailing NUL padding only — never whitespace.
-    let end = memo.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
-    let trimmed = &memo[..end];
-
-    // Reject empty memos.
-    if trimmed.is_empty() {
+    let end = memo.iter().rposition(|&byte| byte != 0).map(|i| i + 1)?;
+    let payload = &memo[..end];
+    if payload.contains(&0) {
         return None;
     }
 
-    // Reject interior NULs — the session ID must be contiguous.
-    if trimmed.contains(&0u8) {
+    let content = payload.strip_prefix(PREFIX)?.strip_suffix(b"}")?;
+    let (session_id, return_address) = match content.iter().position(|&byte| byte == b',') {
+        Some(comma) => (&content[..comma], Some(&content[comma + 1..])),
+        None => (content, None),
+    };
+
+    if session_id.len() != SESSION_ID_LEN || !session_id.iter().all(u8::is_ascii_digit) {
         return None;
     }
 
-    // Must be exactly 16 bytes (16 ASCII digits).
-    if trimmed.len() != SESSION_ID_LEN {
-        return None;
-    }
+    let return_address = match return_address {
+        Some(address) if !address.is_empty() && !address.contains(&b',') => {
+            Some(std::str::from_utf8(address).ok()?.to_owned())
+        }
+        Some(_) => return None,
+        None => None,
+    };
 
-    // All bytes must be ASCII digits.
-    if !trimmed.iter().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-
-    let session_id = std::str::from_utf8(trimmed).ok()?.to_string();
-    Some(ParsedMemo { session_id })
+    Some(ParsedMemo {
+        session_id: std::str::from_utf8(session_id).ok()?.to_owned(),
+        return_address,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn memo_with(s: &str) -> Vec<u8> {
-        let mut m = vec![0u8; MEMO_LEN];
-        let bytes = s.as_bytes();
-        let len = bytes.len().min(MEMO_LEN);
-        m[..len].copy_from_slice(&bytes[..len]);
-        m
+    fn memo_with(text: &str) -> Vec<u8> {
+        let mut memo = vec![0; MEMO_LEN];
+        let bytes = text.as_bytes();
+        memo[..bytes.len()].copy_from_slice(bytes);
+        memo
     }
 
     #[test]
-    fn valid_16_digit_session_id() {
-        let memo = memo_with("1234567890123456");
-        let parsed = parse_memo(&memo).unwrap();
+    fn parses_session_without_return_address() {
+        let memo = memo_with("(DO NOT MODIFY){zfa/1234567890123456}");
+        assert_eq!(
+            parse_memo(&memo),
+            Some(ParsedMemo {
+                session_id: "1234567890123456".to_owned(),
+                return_address: None,
+            })
+        );
+    }
+
+    #[test]
+    fn preserves_the_exact_return_address() {
+        let memo = memo_with("(DO NOT MODIFY){zfa/1234567890123456,u1example-return-address}");
+        let parsed = parse_memo(&memo).expect("valid payload");
         assert_eq!(parsed.session_id, "1234567890123456");
+        assert_eq!(
+            parsed.return_address.as_deref(),
+            Some("u1example-return-address")
+        );
     }
 
     #[test]
-    fn rejects_empty_memo() {
-        let memo = vec![0u8; MEMO_LEN];
+    fn rejects_any_wire_format_change() {
+        for payload in [
+            "1234567890123456",
+            "(DO NOT MODIFY){zfa/123456789012345}",
+            "(DO NOT MODIFY){zfa/12345678901234567}",
+            "(DO NOT MODIFY){zfa/123456789012345a}",
+            "(DO NOT MODIFY){zfa/1234567890123456,}",
+            "(DO NOT MODIFY){zfa/1234567890123456,address,extra}",
+            "(DO NOT MODIFY){zfa/1234567890123456} extra",
+            "(do not modify){zfa/1234567890123456}",
+        ] {
+            assert!(parse_memo(&memo_with(payload)).is_none(), "{payload}");
+        }
+    }
+
+    #[test]
+    fn rejects_interior_nul_and_wrong_memo_length() {
+        let mut memo = memo_with("(DO NOT MODIFY){zfa/1234567890123456}");
+        memo[24] = 0;
         assert!(parse_memo(&memo).is_none());
-    }
-
-    #[test]
-    fn rejects_too_short() {
-        let memo = memo_with("123456789012345"); // 15 digits
-        assert!(parse_memo(&memo).is_none());
-    }
-
-    #[test]
-    fn rejects_too_long() {
-        let memo = memo_with("12345678901234567"); // 17 digits
-        assert!(parse_memo(&memo).is_none());
-    }
-
-    #[test]
-    fn rejects_interior_nul() {
-        let mut memo = memo_with("1234567890123456");
-        memo[8] = 0; // interior NUL
-        assert!(parse_memo(&memo).is_none());
-    }
-
-    #[test]
-    fn rejects_non_digits() {
-        let memo = memo_with("123456789012345A");
-        assert!(parse_memo(&memo).is_none());
-    }
-
-    #[test]
-    fn rejects_whitespace() {
-        let memo = memo_with("123456789012345 ");
-        assert!(parse_memo(&memo).is_none());
-    }
-
-    #[test]
-    fn wrong_length_input_rejected() {
         assert!(parse_memo(b"too short").is_none());
     }
 }

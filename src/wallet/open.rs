@@ -2,7 +2,8 @@
 //!
 //! Ported from zecd's `wallet/open.rs`, simplified for ZFA (Orchard-only, no
 //! transparent gap limits). The wallet DB is exclusively owned and migrated
-//! by `zcash_client_sqlite` — ZFA session state lives in a separate `zfa.db`.
+//! by `zcash_client_sqlite` — ZFA response idempotence lives separately in
+//! `responses.sqlite`.
 
 use std::path::{Path, PathBuf};
 
@@ -34,9 +35,38 @@ pub fn block_path(wallet_dir: &Path, meta: &BlockMeta) -> PathBuf {
 
 /// Open the wallet DB for writing (sync, sends, address generation).
 pub fn open_write(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<WriteDb> {
-    let conn = rusqlite::Connection::open(data_db_path(wallet_dir))?;
+    let path = data_db_path(wallet_dir);
+    let conn = rusqlite::Connection::open(&path)?;
+    restrict_wallet_db_permissions(&path)?;
     configure_writer_conn(&conn)?;
     Ok(WalletDb::from_connection(conn, network, SystemClock, OsRng))
+}
+
+/// `data.sqlite` contains the service viewing key and decrypted transaction
+/// metadata. Keep it owner-readable only, like the encrypted key store.
+#[cfg(unix)]
+fn restrict_wallet_db_permissions(path: &Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut permissions = std::fs::metadata(path)
+        .with_context(|| format!("reading wallet database permissions at {}", path.display()))?
+        .permissions();
+    if permissions.mode() & 0o077 != 0 {
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions).with_context(|| {
+            format!(
+                "restricting wallet database permissions at {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_wallet_db_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// Apply the write-path PRAGMAs (and the array vtab module `WalletDb` requires).
@@ -47,7 +77,12 @@ fn configure_writer_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
 
 /// Open the wallet DB read-only (balances, history); short-lived per request.
 pub fn open_read(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<ReadDb> {
-    Ok(WalletDb::for_path(data_db_path(wallet_dir), network, (), ())?)
+    Ok(WalletDb::for_path(
+        data_db_path(wallet_dir),
+        network,
+        (),
+        (),
+    )?)
 }
 
 /// Open the compact-block cache.

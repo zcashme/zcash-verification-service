@@ -1,13 +1,13 @@
 //! Process and memory hardening against *passive* secret disclosure - the threat where the
 //! wallet seed leaks into a core dump, a swap file, or another process reading this one's
-//! memory (`/proc/<pid>/mem`, `ptrace`), rather than via code execution inside zecd.
+//! memory (`/proc/<pid>/mem`, `ptrace`), rather than via code execution inside the worker.
 //!
 //! Three best-effort, Linux-focused mitigations (each a no-op with a warning if the platform
 //! or the process's privileges don't allow it - a wallet must keep serving, not refuse to
 //! start, if a hardening syscall is denied):
 //!
-//! - **No core dumps** (`RLIMIT_CORE = 0`): a core dump of a crashed zecd would contain the
-//!   in-memory seed. Disabled unless `ZECD_ALLOW_CORE_DUMPS=1` (a debugging escape hatch).
+//! - **No core dumps** (`RLIMIT_CORE = 0`): a core dump of a crashed worker would contain the
+//!   in-memory seed. Disabled only with `ZFA_ALLOW_CORE_DUMPS=1` (a debugging escape hatch).
 //! - **Non-dumpable** (`PR_SET_DUMPABLE = 0`, Linux): also blocks `ptrace` attach and
 //!   `/proc/<pid>/mem` reads by other non-root processes, and re-asserts no-core-dump.
 //! - **`mlock` of the seed** ([`lock_secret`]): pins the page(s) holding the decrypted seed
@@ -16,7 +16,7 @@
 //!   included - under `RLIMIT_MEMLOCK` and typically fails in containers).
 //!
 //! Honest limits: this defends passive capture, not an attacker with code execution inside
-//! zecd (who can read the seed directly). And the
+//! the worker (who can read the seed directly). And the
 //! `mlock` is targeted at the seed buffer; transient key copies made deeper in librustzcash
 //! during derivation/proving are not individually locked (raising `RLIMIT_MEMLOCK` and using
 //! an encrypted swap device covers that residue).
@@ -25,7 +25,7 @@ use tracing::warn;
 
 /// Environment variable that opts out of the core-dump / non-dumpable hardening (for
 /// debugging a crash). `mlock` of the seed is unaffected.
-pub const ALLOW_CORE_DUMPS_ENV: &str = "ZECD_ALLOW_CORE_DUMPS";
+pub const ALLOW_CORE_DUMPS_ENV: &str = "ZFA_ALLOW_CORE_DUMPS";
 
 /// Apply the process-wide hardening once at startup (before any secret is decrypted). Safe to
 /// call from every subcommand; best-effort, so failures are logged and never fatal.
@@ -39,7 +39,7 @@ pub fn harden_process() {
 }
 
 /// Whether the operator opted out of core-dump / non-dumpable hardening. Only the explicit
-/// truthy value `1` opts out; anything else - including `ZECD_ALLOW_CORE_DUMPS=0`, empty, or
+/// truthy value `1` opts out; anything else - including `ZFA_ALLOW_CORE_DUMPS=0`, empty, or
 /// unset - keeps hardening on, matching the documented `=1` escape hatch.
 fn core_dumps_allowed() -> bool {
     matches!(std::env::var(ALLOW_CORE_DUMPS_ENV), Ok(v) if v == "1")
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn only_explicit_1_opts_out_of_core_dump_hardening() {
-        // Guards the ZECD_ALLOW_CORE_DUMPS=0 regression: only `=1` is an opt-out.
+        // Guards the ZFA_ALLOW_CORE_DUMPS=0 regression: only `=1` is an opt-out.
         std::env::set_var(ALLOW_CORE_DUMPS_ENV, "1");
         assert!(core_dumps_allowed());
 

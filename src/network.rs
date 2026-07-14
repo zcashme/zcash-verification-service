@@ -1,4 +1,4 @@
-//! The consensus network a `zecd` instance operates on: mainnet, testnet, or a local
+//! The consensus network a ZFA worker operates on: mainnet, testnet, or a local
 //! regtest chain.
 //!
 //! librustzcash's own [`zcash_protocol::consensus::Network`] only models main/test, but the
@@ -13,7 +13,7 @@ use zcash_protocol::consensus::{
 };
 use zcash_protocol::local_consensus::LocalNetwork;
 
-/// The network `zecd` is configured for. `Copy` so it threads by value through the wallet
+/// The network ZFA is configured for. `Copy` so it threads by value through the wallet
 /// APIs exactly as the upstream `Network` enum did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZNetwork {
@@ -46,8 +46,7 @@ impl ZNetwork {
         }
     }
 
-    /// Whether this is a regtest network. Used to gate developer-only RPCs (e.g. `stop`) so
-    /// they can't be invoked against a live mainnet/testnet daemon over RPC.
+    /// Whether this is a regtest network.
     pub fn is_regtest(&self) -> bool {
         matches!(self, ZNetwork::Regtest(_))
     }
@@ -82,16 +81,16 @@ pub fn regtest() -> ZNetwork {
     // NU6.1/NU6.2 activate a few blocks in, not at genesis: NU6.1's activation block must carry
     // ZIP-271 lockbox disbursements, which require a deferred pool that only accrues once NU6 is
     // live. This must match the regtest chain the harness/zebra run (regtest-harness's
-    // NU6_2_ACTIVATION_HEIGHT) so zecd commits transactions to the right consensus branch id.
+    // NU6_2_ACTIVATION_HEIGHT) so ZFA commits transactions to the right consensus branch id.
     let nu62 = Some(BlockHeight::from_u32(4));
-    // NU6.3 (ironwood) activation on the regtest chain is opt-in via `ZECD_REGTEST_NU63_HEIGHT`.
+    // NU6.3 (ironwood) activation on the regtest chain is opt-in via `ZFA_REGTEST_NU63_HEIGHT`.
     // Ironwood is always compiled now, so the *code* is unconditional; only the regtest activation
     // height is a knob: the ironwood harness configures zebra with NU6.3 at that height (8) and sets
-    // this env var so zecd commits to the matching consensus branch id, while the standard harness
+    // this env var so ZFA commits to the matching consensus branch id, while the standard harness
     // leaves it unset (no NU6.3) to match its stock zebra. (Real networks get their heights from the
     // pinned protocol - NU6.3 is unset on mainnet and 4_134_000 on testnet - so this only affects
     // regtest.) An unset/unparseable value means no NU6.3, exactly like the old default build.
-    let nu63 = std::env::var("ZECD_REGTEST_NU63_HEIGHT")
+    let nu63 = std::env::var("ZFA_REGTEST_NU63_HEIGHT")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .map(BlockHeight::from_u32);
