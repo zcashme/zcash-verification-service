@@ -26,9 +26,17 @@ use zcash_protocol::TxId;
 pub enum ResponseState {
     /// A response was claimed but a transaction ID was not yet durably recorded.
     Claimed,
-    /// The wallet constructed a response transaction; it is safe to rebroadcast this txid.
+    /// The wallet constructed a response transaction; it has not yet been sent
+    /// to the network. Safe to rebroadcast this txid.
     Created { response_txid: TxId },
-    /// lightwalletd accepted the response transaction for broadcast.
+    /// The response transaction is in flight to the network. A crash in this
+    /// state leaves the actual network status unknown — the tx may or may not
+    /// be in the mempool — so the restart path rebroadcasts defensively. The
+    /// common LWD/zebra outcome for a rebroadcast is "already exists", which
+    /// is exactly the precondition `record_broadcast` tracks.
+    Broadcasting { response_txid: TxId },
+    /// lightwalletd accepted the response transaction for broadcast (or
+    /// acknowledged it as already known).
     Broadcast { response_txid: TxId },
 }
 
@@ -58,14 +66,14 @@ pub fn init_db(path: &Path) -> anyhow::Result<Connection> {
          PRAGMA synchronous=FULL;
          CREATE TABLE IF NOT EXISTS otp_response_ledger (
              incoming_txid TEXT PRIMARY KEY NOT NULL,
-             state TEXT NOT NULL CHECK (state IN ('claimed', 'created', 'broadcast')),
+             state TEXT NOT NULL CHECK (state IN ('claimed', 'created', 'broadcasting', 'broadcast')),
              response_txid BLOB,
              received_at INTEGER NOT NULL,
              created_at INTEGER,
              broadcast_at INTEGER,
              CHECK (
                 (state = 'claimed' AND response_txid IS NULL)
-                OR (state IN ('created', 'broadcast') AND response_txid IS NOT NULL)
+                OR (state IN ('created', 'broadcasting', 'broadcast') AND response_txid IS NOT NULL)
              )
          );",
     )?;
@@ -210,6 +218,9 @@ fn parse_state(state: &str, response_txid: Option<Vec<u8>>) -> anyhow::Result<Re
     match (state, response_txid) {
         ("claimed", None) => Ok(ResponseState::Claimed),
         ("created", Some(response_txid)) => Ok(ResponseState::Created {
+            response_txid: parse_txid(response_txid)?,
+        }),
+        ("broadcasting", Some(response_txid)) => Ok(ResponseState::Broadcasting {
             response_txid: parse_txid(response_txid)?,
         }),
         ("broadcast", Some(response_txid)) => Ok(ResponseState::Broadcast {

@@ -446,7 +446,10 @@ impl WalletActor {
                     self.broadcast_and_record(response_ledger, &incoming_txid, response_txid)
                         .await;
                 }
-                Ok(Claim::AlreadyHandled(ResponseState::Created { response_txid })) => {
+                Ok(Claim::AlreadyHandled(
+                    ResponseState::Created { response_txid }
+                    | ResponseState::Broadcasting { response_txid },
+                )) => {
                     self.broadcast_and_record(response_ledger, &incoming_txid, response_txid)
                         .await;
                 }
@@ -623,6 +626,14 @@ impl WalletActor {
             .await?;
 
         if error_code != 0 {
+            // "transaction already exists in mempool" means the tx was
+            // successfully broadcast before (e.g. by a previous worker run
+            // that crashed before recording the broadcast). Treat it as
+            // success — the tx is in the mempool, which is the goal.
+            if error_message.contains("already exists") {
+                info!("[zfa] response tx already in mempool — treating as broadcast");
+                return Ok(());
+            }
             return Err(anyhow::anyhow!(
                 "lightwalletd rejected transaction: code {error_code}, message: {error_message}"
             ));

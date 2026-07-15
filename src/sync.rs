@@ -171,7 +171,7 @@ fn rewind_wallet(
 
 /// Download compact blocks for a scan range and write them to the block cache.
 async fn download_blocks(
-    name: &str,
+    _name: &str,
     client: &mut LwdClient,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
