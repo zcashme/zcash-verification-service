@@ -1,20 +1,35 @@
-# zfa-backend
+# ZcashMe Authenticator Node (`zfa-backend`)
 
-The ZFA (Zcash Factor Authentication) worker — a Rust background process that watches the Zcash mempool for shielded login payments and sends deterministic OTP responses.
+The **ZcashMe Authenticator Node** is a headless, on-chain One-Time-Password (OTP) relayer. It watches the Zcash mempool for shielded login payments and instantly fires back deterministic OTP responses via encrypted transaction memos.
+
+## Why OTPs instead of Signatures?
+
+If you're coming from Ethereum (SIWE), you might wonder why we don't just use arbitrary message signing. 
+
+1. **The Human Airgap:** Zcash users use mobile wallets. If a mobile phone signs a massive cryptographic string, the user can't easily type it into their desktop browser. A 6-digit OTP lets the human act as the secure relay.
+2. **The Transaction IS the Proof:** A shielded transaction is already a Zero-Knowledge Proof (zk-SNARK). Making the payment natively proves you own the spending key. The OTP simply bridges the result of that on-chain proof back to the web session.
 
 ## What it does
 
-```
-Consumer app server             response ledger       ZFA worker
-───────────────────             ───────────────       ──────────
-creates app session                                      connects to lightwalletd (zec.rocks)
-renders ZIP-321 QR               incoming txid ──→      watches GetMempoolStream
-verifies OTP locally             response txid          decrypts and sends OTP response
+```text
+Identity Broker                 Zcash Blockchain        Authenticator Node
+───────────────                 ────────────────        ──────────────────
+1. Renders QR                    
+                                2. Watches mempool ←─── 3. Listens to lightwalletd
+4. User pays via mobile ──────→ 5. Incoming txid 
+                                6. Response txid ←───── 7. Decrypts & sends OTP memo
+8. Verifies OTP locally                 
 ```
 
-The worker owns one shielded Zcash wallet. It watches the mempool, trial-decrypts incoming payments with its viewing keys, and when it detects an auth payment above the minimum threshold, constructs and broadcasts an OTP response transaction back to the sender's return address. The OTP code is in the transaction memo.
+This node is the blockchain engine of the stack. It holds the receiver wallet for all authentication payments. 
 
-The worker is **not an API server** and does **not own login sessions**. The consumer application creates sessions, renders the ZIP-321 payment request, and verifies the OTP locally using the same HMAC key.
+When a user attempts to log in, this node:
+1. Detects the incoming payment in the mempool.
+2. Trial-decrypts it to verify it's a valid auth request.
+3. Derives a deterministic 6-digit OTP using an HMAC key derived from its wallet seed.
+4. Broadcasts a response transaction back to the user, with the OTP code hidden in the memo.
+
+**It is not an API server.** It has no open HTTP ports, no database of users, and knows nothing about web sessions. It acts purely as a decentralized, on-chain oracle.
 
 ## Quick start
 
