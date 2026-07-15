@@ -562,6 +562,19 @@ impl WalletActor {
         incoming_txid: &str,
         response_txid: TxId,
     ) {
+        if let Err(e) = response_ledger::record_broadcasting(
+            response_ledger,
+            incoming_txid,
+            &response_txid,
+        ) {
+            error!(
+                txid = %incoming_txid,
+                response_txid = %response_txid,
+                "[zfa] response could not be marked as broadcasting: {e}"
+            );
+            return;
+        }
+
         match self.broadcast_response(response_txid).await {
             Ok(()) => {
                 if let Err(e) = response_ledger::record_broadcast(

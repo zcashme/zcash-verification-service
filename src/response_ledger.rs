@@ -21,6 +21,20 @@ use anyhow::Context as _;
 use rusqlite::{Connection, OptionalExtension};
 use zcash_protocol::TxId;
 
+const CREATE_LEDGER_TABLE: &str = "
+    CREATE TABLE otp_response_ledger (
+        incoming_txid TEXT PRIMARY KEY NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('claimed', 'created', 'broadcasting', 'broadcast')),
+        response_txid BLOB,
+        received_at INTEGER NOT NULL,
+        created_at INTEGER,
+        broadcast_at INTEGER,
+        CHECK (
+            (state = 'claimed' AND response_txid IS NULL)
+            OR (state IN ('created', 'broadcasting', 'broadcast') AND response_txid IS NOT NULL)
+        )
+    );";
+
 /// The persistent status of one incoming authentication transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseState {
@@ -57,27 +71,50 @@ pub struct PendingBroadcast {
 
 /// Initialize the worker-local response ledger.
 pub fn init_db(path: &Path) -> anyhow::Result<Connection> {
-    let conn = Connection::open(path)
+    let mut conn = Connection::open(path)
         .with_context(|| format!("opening response ledger at {}", path.display()))?;
     restrict_permissions(path)?;
     conn.busy_timeout(Duration::from_secs(5))?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=FULL;
-         CREATE TABLE IF NOT EXISTS otp_response_ledger (
-             incoming_txid TEXT PRIMARY KEY NOT NULL,
-             state TEXT NOT NULL CHECK (state IN ('claimed', 'created', 'broadcasting', 'broadcast')),
-             response_txid BLOB,
-             received_at INTEGER NOT NULL,
-             created_at INTEGER,
-             broadcast_at INTEGER,
-             CHECK (
-                (state = 'claimed' AND response_txid IS NULL)
-                OR (state IN ('created', 'broadcasting', 'broadcast') AND response_txid IS NOT NULL)
-             )
-         );",
-    )?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+
+    let schema: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'table' AND name = 'otp_response_ledger'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match schema {
+        None => conn.execute_batch(CREATE_LEDGER_TABLE)?,
+        Some(schema) if schema.contains("'broadcasting'") => {}
+        Some(_) => migrate_ledger_schema(&mut conn)?,
+    }
     Ok(conn)
+}
+
+/// Upgrade the original three-state schema without losing existing claims.
+///
+/// SQLite cannot alter a table-level `CHECK` constraint in place, so the
+/// migration copies the small worker-local ledger through a replacement table
+/// inside one transaction. Existing `created` rows remain pending and are
+/// moved to `broadcasting` by the next retry attempt.
+fn migrate_ledger_schema(conn: &mut Connection) -> anyhow::Result<()> {
+    let transaction = conn.transaction()?;
+    transaction.execute_batch(
+        "ALTER TABLE otp_response_ledger RENAME TO otp_response_ledger_legacy;",
+    )?;
+    transaction.execute_batch(CREATE_LEDGER_TABLE)?;
+    transaction.execute_batch(
+        "INSERT INTO otp_response_ledger
+             (incoming_txid, state, response_txid, received_at, created_at, broadcast_at)
+         SELECT incoming_txid, state, response_txid, received_at, created_at, broadcast_at
+         FROM otp_response_ledger_legacy;
+         DROP TABLE otp_response_ledger_legacy;",
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 /// The ledger contains only public transaction identifiers, but it is kept
@@ -153,7 +190,41 @@ pub fn record_created(
     Ok(())
 }
 
-/// Mark a previously-created response transaction as accepted by the server.
+/// Durably record that a response transaction is being sent to the server.
+///
+/// This transition deliberately happens before the network request. If the
+/// process dies while the request is in flight, the next worker run will find
+/// this row in [`pending_broadcasts`] and retry the exact same transaction.
+/// Repeating this call for the same in-flight transaction is safe.
+pub fn record_broadcasting(
+    conn: &mut Connection,
+    incoming_txid: &str,
+    response_txid: &TxId,
+) -> anyhow::Result<()> {
+    let changed = conn.execute(
+        "UPDATE otp_response_ledger
+         SET state = 'broadcasting'
+         WHERE incoming_txid = ?1 AND state = 'created' AND response_txid = ?2",
+        rusqlite::params![incoming_txid, response_txid.as_ref().as_slice()],
+    )?;
+    if changed == 1 {
+        return Ok(());
+    }
+
+    match get(conn, incoming_txid)? {
+        Some(ResponseState::Broadcasting {
+            response_txid: recorded_txid,
+        }) if recorded_txid == *response_txid => Ok(()),
+        Some(state) => anyhow::bail!(
+            "response ledger transition created -> broadcasting was rejected (current state: {state:?})"
+        ),
+        None => anyhow::bail!(
+            "response ledger transition created -> broadcasting was rejected (entry missing)"
+        ),
+    }
+}
+
+/// Mark a previously-broadcasting response transaction as accepted by the server.
 pub fn record_broadcast(
     conn: &mut Connection,
     incoming_txid: &str,
@@ -162,7 +233,7 @@ pub fn record_broadcast(
     let changed = conn.execute(
         "UPDATE otp_response_ledger
          SET state = 'broadcast', broadcast_at = ?1
-         WHERE incoming_txid = ?2 AND state = 'created' AND response_txid = ?3",
+         WHERE incoming_txid = ?2 AND state = 'broadcasting' AND response_txid = ?3",
         rusqlite::params![
             now_unix_seconds()?,
             incoming_txid,
@@ -170,7 +241,7 @@ pub fn record_broadcast(
         ],
     )?;
     if changed != 1 {
-        anyhow::bail!("response ledger transition created -> broadcast was rejected");
+        anyhow::bail!("response ledger transition broadcasting -> broadcast was rejected");
     }
     Ok(())
 }
@@ -188,14 +259,15 @@ pub fn get(conn: &Connection, incoming_txid: &str) -> anyhow::Result<Option<Resp
 }
 
 /// List responses whose transaction was persisted in the wallet but has not
-/// yet received a successful broadcast acknowledgement. Rebroadcasting one of
-/// these transactions is safe and is how the worker recovers an interruption
-/// after construction but before transmission.
+/// yet received a successful broadcast acknowledgement. `created` entries
+/// have not started a send attempt; `broadcasting` entries may already be in
+/// the mempool. Rebroadcasting either is safe and is how the worker recovers
+/// an interruption before or during transmission.
 pub fn pending_broadcasts(conn: &Connection) -> anyhow::Result<Vec<PendingBroadcast>> {
     let mut statement = conn.prepare(
         "SELECT incoming_txid, response_txid
          FROM otp_response_ledger
-         WHERE state = 'created'
+         WHERE state IN ('created', 'broadcasting')
          ORDER BY created_at ASC",
     )?;
     let rows = statement.query_map([], |row| {
@@ -207,7 +279,7 @@ pub fn pending_broadcasts(conn: &Connection) -> anyhow::Result<Vec<PendingBroadc
             incoming_txid,
             response_txid: parse_txid(
                 response_txid
-                    .ok_or_else(|| anyhow::anyhow!("created response has no transaction ID"))?,
+                    .ok_or_else(|| anyhow::anyhow!("pending response has no transaction ID"))?,
             )?,
         })
     })
@@ -261,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn created_transaction_can_be_rebroadcast_without_creating_another() {
+    fn created_or_broadcasting_transaction_can_be_rebroadcast_without_creating_another() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let mut conn = init_db(&dir.path().join("responses.sqlite")).expect("ledger");
         claim(&mut conn, "txid").expect("claim");
@@ -278,6 +350,20 @@ mod tests {
                 response_txid,
             }]
         );
+        record_broadcasting(&mut conn, "txid", &response_txid).expect("record send attempt");
+        assert_eq!(
+            get(&conn, "txid").expect("read"),
+            Some(ResponseState::Broadcasting { response_txid })
+        );
+        record_broadcasting(&mut conn, "txid", &response_txid)
+            .expect("repeat record send attempt");
+        assert_eq!(
+            pending_broadcasts(&conn).expect("pending broadcasts"),
+            vec![PendingBroadcast {
+                incoming_txid: "txid".to_owned(),
+                response_txid,
+            }]
+        );
         record_broadcast(&mut conn, "txid", &response_txid).expect("record broadcast");
         assert!(pending_broadcasts(&conn)
             .expect("pending broadcasts")
@@ -285,6 +371,39 @@ mod tests {
         assert_eq!(
             get(&conn, "txid").expect("read"),
             Some(ResponseState::Broadcast { response_txid })
+        );
+    }
+
+    #[test]
+    fn legacy_ledger_is_migrated_before_broadcasting_is_recorded() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("responses.sqlite");
+        let conn = Connection::open(&path).expect("legacy ledger");
+        conn.execute_batch(
+            "CREATE TABLE otp_response_ledger (
+                 incoming_txid TEXT PRIMARY KEY NOT NULL,
+                 state TEXT NOT NULL CHECK (state IN ('claimed', 'created', 'broadcast')),
+                 response_txid BLOB,
+                 received_at INTEGER NOT NULL,
+                 created_at INTEGER,
+                 broadcast_at INTEGER,
+                 CHECK (
+                     (state = 'claimed' AND response_txid IS NULL)
+                     OR (state IN ('created', 'broadcast') AND response_txid IS NOT NULL)
+                 )
+             );",
+        )
+        .expect("create legacy schema");
+        drop(conn);
+
+        let mut conn = init_db(&path).expect("migrate legacy ledger");
+        let response_txid = TxId::from_bytes([9; 32]);
+        claim(&mut conn, "txid").expect("claim");
+        record_created(&mut conn, "txid", &response_txid).expect("record creation");
+        record_broadcasting(&mut conn, "txid", &response_txid).expect("record send attempt");
+        assert_eq!(
+            get(&conn, "txid").expect("read"),
+            Some(ResponseState::Broadcasting { response_txid })
         );
     }
 }

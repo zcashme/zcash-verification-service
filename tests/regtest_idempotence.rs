@@ -6,13 +6,13 @@
 //!    stream (e.g. after a worker reconnect) results in exactly one response,
 //!    not two. The ledger's `claim` prevents double-creation.
 //!
-//! 2. **Crash recovery**: if the worker crashes after creating a response tx
-//!    (ledger state = "created") but before broadcasting it, the restarted
-//!    worker picks up the pending tx and rebroadcasts it via
+//! 2. **Crash recovery**: if the worker crashes while a response tx is being
+//!    sent (ledger state = "broadcasting"), the restarted worker picks up the
+//!    pending tx and rebroadcasts it via
 //!    `rebroadcast_pending_responses`.
 //!
 //! Both are exercised in one flow: send an auth payment, catch the ledger at
-//! "created" before broadcast completes, kill the worker, restart it, and
+//! "broadcasting" before the send returns, kill the worker, restart it, and
 //! verify it rebroadcasts the existing tx rather than creating a new one.
 //!
 //! Skips cleanly when binaries aren't provisioned. Requires the
@@ -24,7 +24,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use tokio::process as tokio_process;
 
@@ -556,13 +555,6 @@ impl ZfaWorker {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
-    /// Count ledger entries in a given state.
-    fn ledger_count(&self, state: &str) -> Result<usize> {
-        Ok(self.ledger_entries()?
-            .iter()
-            .filter(|(_, s, _)| s == state)
-            .count())
-    }
 }
 
 impl Drop for ZfaWorker {
@@ -632,12 +624,12 @@ async fn regtest_idempotence_and_crash_recovery() {
     let auth_memo = format!("(DO NOT MODIFY){{zfa/{SESSION_ID},{funder_ua}}}");
     funder.send_with_memo(lwd.grpc_port, &worker.service_address, AUTH_PAYMENT_ZATOSHIS, Some(&auth_memo)).expect("send auth payment");
 
-    // ── 6. Wait for ledger to reach "created" then kill the worker ──────────
+    // ── 6. Wait for ledger to reach "broadcasting" then kill the worker ─────
     //
     // The worker flow is: claim → create_otp_response → record_created →
-    // broadcast_and_record. There's an async gap between record_created
-    // (state = "created") and broadcast_and_record (state = "broadcast").
-    // We poll for "created" and kill the worker before broadcast completes.
+    // record_broadcasting → SendTransaction → record_broadcast. There is an
+    // async gap after the durable "broadcasting" write and before the gRPC
+    // send returns. We poll for that state and kill the worker in the gap.
     // If we miss the window and it reaches "broadcast", that also proves the
     // happy path — we then test idempotence by killing and restarting anyway.
 
@@ -645,9 +637,10 @@ async fn regtest_idempotence_and_crash_recovery() {
     let killed_before_broadcast = loop {
         let entries = worker.ledger_entries().expect("read ledger");
         if let Some((_, state, _)) = entries.first() {
-            if state == "created" {
-                // Caught it! Kill before broadcast.
-                eprintln!("[test] caught ledger at 'created' — killing worker");
+            if state == "broadcasting" {
+                // Caught the durable in-flight state. Kill before the send
+                // result can be recorded.
+                eprintln!("[test] caught ledger at 'broadcasting' — killing worker");
                 worker.kill().await;
                 break true;
             }
@@ -659,7 +652,7 @@ async fn regtest_idempotence_and_crash_recovery() {
                 break false;
             }
         }
-        assert!(Instant::now() < deadline, "worker did not create a response within 60s");
+        assert!(Instant::now() < deadline, "worker did not start broadcasting within 60s");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
@@ -668,9 +661,9 @@ async fn regtest_idempotence_and_crash_recovery() {
     // The auth payment is still in the mempool (we didn't mine any blocks).
     // The restarted worker will:
     //   - Open the mempool stream and see the same auth payment again
-    //   - Call claim() → AlreadyHandled(Created) or AlreadyHandled(Broadcast)
+    //   - Call claim() → AlreadyHandled(Broadcasting) or AlreadyHandled(Broadcast)
     //   - NOT create a second response tx (idempotence)
-    //   - If "created": rebroadcast the existing pending tx (crash recovery)
+    //   - If "broadcasting": rebroadcast the existing pending tx (crash recovery)
     //   - If "broadcast": just acknowledge it's done
 
     let worker2 = worker.restart(lwd.grpc_port).await.expect("restart worker");
@@ -717,7 +710,7 @@ async fn regtest_idempotence_and_crash_recovery() {
     );
 
     eprintln!("\n✓ idempotence + crash recovery passed:");
-    eprintln!("  killed before broadcast: {killed_before_broadcast}");
+    eprintln!("  killed during broadcast: {killed_before_broadcast}");
     eprintln!("  ledger entries:          {}", entries.len());
     eprintln!("  final state:             {state}");
     eprintln!("  response txid:           {}", hex::encode(response_txid.as_ref().unwrap()));
