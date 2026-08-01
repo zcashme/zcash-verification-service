@@ -35,8 +35,12 @@ pub fn account_ufvk_encoded(
 /// Derive the network-specific encoded UFVK from the service seed at account
 /// zero, the same ZIP-32 account index used by wallet initialization.
 pub fn seed_ufvk_encoded(network: ZNetwork, seed: &SecretVec<u8>) -> anyhow::Result<String> {
-    let account_index = zip32::AccountId::try_from(crate::config::ACCOUNT_INDEX)
-        .map_err(|_| anyhow!("account {} is not a valid ZIP-32 account", crate::config::ACCOUNT_INDEX))?;
+    let account_index = zip32::AccountId::try_from(crate::config::ACCOUNT_INDEX).map_err(|_| {
+        anyhow!(
+            "account {} is not a valid ZIP-32 account",
+            crate::config::ACCOUNT_INDEX
+        )
+    })?;
     let usk = UnifiedSpendingKey::from_seed(&network, seed.expose_secret(), account_index)
         .map_err(|_| anyhow!("deriving the service unified spending key failed"))?;
     Ok(usk.to_unified_full_viewing_key().encode(&network))

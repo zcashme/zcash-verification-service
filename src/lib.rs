@@ -27,7 +27,7 @@
 //! A single `zfa.toml` containing a `[seed]` table (age-encrypted mnemonic +
 //! birthday). All operational settings (network, LWD URL, sync intervals) are
 //! hardcoded. The OTP HMAC key is derived from the seed:
-//! `HMAC-SHA256(seed, "zfa-otp-v1")`.
+//! `HMAC-SHA256(seed, "zvs-otp")`.
 //!
 //! ## Dependencies (librustzcash ironwood line)
 //!
@@ -79,10 +79,7 @@ pub async fn init_wallet(
 
     // Generate or restore mnemonic. The presence of --mnemonic determines mode.
     let (mnemonic, is_restore) = match &args.mnemonic {
-        Some(phrase) => (
-            <Mnemonic<English>>::from_phrase(phrase.trim())?,
-            true,
-        ),
+        Some(phrase) => (<Mnemonic<English>>::from_phrase(phrase.trim())?, true),
         None => (Mnemonic::generate(Count::Words24), false),
     };
 
@@ -99,8 +96,12 @@ pub async fn init_wallet(
         secret
     };
 
-    let account_index = zip32::AccountId::try_from(config::ACCOUNT_INDEX)
-        .map_err(|_| anyhow::anyhow!("account {} is not a valid ZIP-32 account", config::ACCOUNT_INDEX))?;
+    let account_index = zip32::AccountId::try_from(config::ACCOUNT_INDEX).map_err(|_| {
+        anyhow::anyhow!(
+            "account {} is not a valid ZIP-32 account",
+            config::ACCOUNT_INDEX
+        )
+    })?;
     let usk =
         UnifiedSpendingKey::from_seed(&config.network, seed_bytes.expose_secret(), account_index)
             .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;

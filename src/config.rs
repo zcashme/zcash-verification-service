@@ -167,8 +167,7 @@ impl ConfigFile {
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        toml::from_str(&text)
-            .with_context(|| format!("parsing config {}", path.display()))
+        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
     }
 
     /// Write the `[seed]` table to `path`, creating the file `0600`.
@@ -183,8 +182,8 @@ impl ConfigFile {
                 mnemonic: mnemonic_ciphertext.to_string(),
             }),
         };
-        let text = toml::to_string(&config)
-            .map_err(|e| anyhow::anyhow!("serializing zfa.toml: {e}"))?;
+        let text =
+            toml::to_string(&config).map_err(|e| anyhow::anyhow!("serializing zfa.toml: {e}"))?;
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -219,10 +218,7 @@ impl AppConfig {
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DATADIR));
 
         // Config file: explicit --conf, else <datadir>/zfa.toml.
-        let conf_path = cli
-            .conf
-            .clone()
-            .unwrap_or_else(|| datadir.join("zfa.toml"));
+        let conf_path = cli.conf.clone().unwrap_or_else(|| datadir.join("zfa.toml"));
 
         // Seed file: explicit --keys-file (escape hatch), else same as conf_path.
         let seed_path = cli.keys_file.clone().unwrap_or_else(|| conf_path.clone());
@@ -258,7 +254,7 @@ impl AppConfig {
 
 /// Derive the 32-byte OTP HMAC key from the wallet seed.
 ///
-/// `HMAC-SHA256(seed, "zfa-otp-v1")` — deterministic, so the consumer
+/// `HMAC-SHA256(seed, "zvs-otp")` — deterministic, so the consumer
 /// application's server can derive the same key from the same seed (exported
 /// once during `init`). No env var, no config file entry, no shared secret to
 /// rotate independently.
@@ -266,7 +262,7 @@ pub fn derive_otp_key(seed: &[u8]) -> secrecy::SecretVec<u8> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     let mut mac = Hmac::<Sha256>::new_from_slice(seed).expect("HMAC accepts any key length");
-    mac.update(b"zfa-otp-v1");
+    mac.update(b"zvs-otp");
     let result = mac.finalize().into_bytes();
     secrecy::SecretVec::new(result.to_vec())
 }

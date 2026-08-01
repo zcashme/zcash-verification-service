@@ -80,9 +80,7 @@ pub async fn sync_one_batch(
         // requests tree state at height 0 (the genesis block, whose commitment
         // trees are empty).
         if start == 0 {
-            anyhow::bail!(
-                "cannot scan from genesis (height 0): no prior chain state exists"
-            );
+            anyhow::bail!("cannot scan from genesis (height 0): no prior chain state exists");
         }
         let prior_height = BlockHeight::from(start - 1);
 

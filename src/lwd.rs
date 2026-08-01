@@ -35,8 +35,19 @@ pub struct LwdClient {
 impl LwdClient {
     /// Connect to the lightwalletd/Zaino gRPC endpoint.
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        let channel = tonic::transport::Channel::from_shared(url.to_string())
-            .context("invalid gRPC URL")?
+        let endpoint =
+            tonic::transport::Channel::from_shared(url.to_string()).context("invalid gRPC URL")?;
+
+        // Configure TLS for HTTPS endpoints.
+        let endpoint = if url.starts_with("https://") {
+            endpoint
+                .tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots())
+                .context("TLS config")?
+        } else {
+            endpoint
+        };
+
+        let channel = endpoint
             .connect()
             .await
             .context("failed to connect to lightwalletd gRPC endpoint")?;

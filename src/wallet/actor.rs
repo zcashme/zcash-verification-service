@@ -42,12 +42,12 @@ use crate::wallet::open::{self, WriteDb};
 use crate::wallet::store::WalletStore;
 
 /// Note-management defaults (from zecd).
-const TARGET_NOTE_COUNT: usize = 4;
-const MIN_SPLIT_OUTPUT_VALUE: u64 = 10_000_000; // 0.1 ZEC
+const TARGET_NOTE_COUNT: usize = 3;
+const MIN_SPLIT_OUTPUT_VALUE: u64 = 500_000; // 0.005 ZEC — covers ~8 OTP responses per note
 /// An incoming note must pay at least 0.002 ZEC to request an OTP response.
 const MIN_AUTH_PAYMENT: u64 = 200_000;
 /// Fixed OTP response amount, retained from the original worker.
-const OTP_RESPONSE_AMOUNT: u64 = 1_000;
+const OTP_RESPONSE_AMOUNT: u64 = 50_000;
 
 /// Parameters needed to launch the wallet actor.
 pub struct ActorConfig {
@@ -534,8 +534,13 @@ impl WalletActor {
         let request = zip321::TransactionRequest::new(vec![payment])
             .map_err(|e| anyhow::anyhow!("invalid transaction request: {e}"))?;
 
-        let account_index = zip32::AccountId::try_from(crate::config::ACCOUNT_INDEX)
-            .map_err(|_| anyhow::anyhow!("account {} is not a valid ZIP-32 account", crate::config::ACCOUNT_INDEX))?;
+        let account_index =
+            zip32::AccountId::try_from(crate::config::ACCOUNT_INDEX).map_err(|_| {
+                anyhow::anyhow!(
+                    "account {} is not a valid ZIP-32 account",
+                    crate::config::ACCOUNT_INDEX
+                )
+            })?;
         let usk = self.seed.derive_usk(self.network, account_index)?;
 
         let txids = do_send_otp_response(
@@ -562,11 +567,9 @@ impl WalletActor {
         incoming_txid: &str,
         response_txid: TxId,
     ) {
-        if let Err(e) = response_ledger::record_broadcasting(
-            response_ledger,
-            incoming_txid,
-            &response_txid,
-        ) {
+        if let Err(e) =
+            response_ledger::record_broadcasting(response_ledger, incoming_txid, &response_txid)
+        {
             error!(
                 txid = %incoming_txid,
                 response_txid = %response_txid,
@@ -720,7 +723,7 @@ fn do_send_otp_response(
     let change_strategy = MultiOutputChangeStrategy::new(
         StandardFeeRule::Zip317,
         None,
-        zcash_protocol::ShieldedPool::Orchard,
+        zcash_protocol::ShieldedPool::Ironwood,
         DustOutputPolicy::default(),
         SplitPolicy::with_min_output_value(target_note_count, min_split_output),
     );
@@ -736,7 +739,8 @@ fn do_send_otp_response(
         request,
         policy,
         &SpendPolicy::default(),
-        None,
+        None, // lock_inputs
+        None, // proposed_version
     )
     .map_err(
         |e: zcash_client_backend::data_api::error::Error<
@@ -757,6 +761,7 @@ fn do_send_otp_response(
         &SpendingKeys::from_unified_spending_key(usk.clone()),
         OvkPolicy::Sender,
         &proposal,
+        None, // expiry_height
     )
     .map_err(
         |e: zcash_client_backend::data_api::error::Error<

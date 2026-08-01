@@ -102,9 +102,8 @@ pub fn init_db(path: &Path) -> anyhow::Result<Connection> {
 /// moved to `broadcasting` by the next retry attempt.
 fn migrate_ledger_schema(conn: &mut Connection) -> anyhow::Result<()> {
     let transaction = conn.transaction()?;
-    transaction.execute_batch(
-        "ALTER TABLE otp_response_ledger RENAME TO otp_response_ledger_legacy;",
-    )?;
+    transaction
+        .execute_batch("ALTER TABLE otp_response_ledger RENAME TO otp_response_ledger_legacy;")?;
     transaction.execute_batch(CREATE_LEDGER_TABLE)?;
     transaction.execute_batch(
         "INSERT INTO otp_response_ledger
@@ -355,8 +354,7 @@ mod tests {
             get(&conn, "txid").expect("read"),
             Some(ResponseState::Broadcasting { response_txid })
         );
-        record_broadcasting(&mut conn, "txid", &response_txid)
-            .expect("repeat record send attempt");
+        record_broadcasting(&mut conn, "txid", &response_txid).expect("repeat record send attempt");
         assert_eq!(
             pending_broadcasts(&conn).expect("pending broadcasts"),
             vec![PendingBroadcast {

@@ -3,7 +3,7 @@
 //! The worker and the consumer application's server compute exactly:
 //!
 //! ```text
-//! HMAC-SHA256(secret, session_id + ":" + address)[0..4]
+//! HMAC-SHA256(secret, session_id + address)[0..4]
 //! ```
 //!
 //! The first four bytes are interpreted as a big-endian `u32`, reduced modulo
@@ -18,7 +18,6 @@ use sha2::Sha256;
 pub fn generate_otp(secret: &[u8], session_id: &str, address: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(session_id.as_bytes());
-    mac.update(b":");
     mac.update(address.as_bytes());
     let digest = mac.finalize().into_bytes();
 
@@ -41,7 +40,7 @@ mod tests {
         let secret: Vec<u8> = (0u8..=31).collect();
         assert_eq!(
             generate_otp(&secret, "1234567890123456", "u1example-return-address"),
-            "927931"
+            "880279"
         );
     }
 

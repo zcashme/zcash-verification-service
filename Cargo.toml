@@ -14,7 +14,7 @@ path = "src/main.rs"
 tokio = { version = "1.21", features = ["rt-multi-thread", "macros", "fs", "signal", "sync", "time", "io-util"] }
 
 # gRPC (tonic comes through zcash_client_backend but we need the transport/codec types directly)
-tonic = { version = "0.14", default-features = false }
+tonic = { version = "0.14", features = ["channel", "tls-native-roots", "tls-ring"] }
 
 # Serialization / config / logging
 serde = { version = "1.0", features = ["derive"] }
@@ -26,11 +26,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 
 # Zcash — pinned to the ironwood/NU6.3 librustzcash line (same as zecd)
 zcash_address = "0.13"
-zcash_client_backend = { version = "0.24.0-rc.1", features = ["orchard", "transparent-inputs", "lightwalletd-tonic-transport"] }
-zcash_client_sqlite = { version = "0.22.0-rc.1", features = ["unstable", "orchard", "transparent-inputs"] }
-zcash_keys = { version = "0.15", features = ["unstable", "orchard"] }
-zcash_primitives = "0.29"
-zcash_proofs = { version = "0.29", features = ["bundled-prover"] }
+zcash_client_backend = { version = "0.24.0-rc.6", features = ["orchard", "transparent-inputs", "lightwalletd-tonic-transport"] }
+zcash_client_sqlite = { version = "0.22.0-rc.6", features = ["unstable", "orchard", "transparent-inputs"] }
+zcash_keys = { version = "0.16", features = ["unstable", "orchard"] }
+zcash_primitives = "0.30"
+zcash_proofs = { version = "0.30", features = ["bundled-prover"] }
 zcash_protocol = { version = "0.10", features = ["local-consensus"] }
 orchard = { version = "0.15", default-features = false, features = ["circuit"] }
 
