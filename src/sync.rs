@@ -29,27 +29,21 @@ use crate::wallet::open::{block_path, WriteDb};
 
 const BATCH_SIZE: u32 = 10_000;
 
-/// Outcome of one sync batch.
-pub struct BatchOutcome {
-    /// Whether a batch was scanned (caller should call again).
-    pub worked: bool,
-}
-
 /// Process at most one batch of confirmed-block sync work.
 ///
-/// Returns `worked = true` if blocks were scanned (caller should call again),
+/// Returns `true` if blocks were scanned (caller should call again),
 /// `false` if the wallet is caught up (no pending scan ranges).
 pub async fn sync_one_batch(
     name: &str,
     client: &mut LwdClient,
-    params: &ZNetwork,
+    params: ZNetwork,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
     db_data: &mut WriteDb,
-) -> anyhow::Result<BatchOutcome> {
+) -> anyhow::Result<bool> {
     let scan_ranges = db_data.suggest_scan_ranges()?;
     let Some(first) = scan_ranges.first() else {
-        return Ok(BatchOutcome { worked: false });
+        return Ok(false);
     };
 
     // A Verify range is small; scan it whole. Otherwise scan the first BATCH_SIZE chunk.
@@ -65,7 +59,7 @@ pub async fn sync_one_batch(
     info!("[{name}] syncing {scan_range}");
 
     // Download compact blocks for this range.
-    let block_meta = download_blocks(name, client, wallet_dir, db_cache, &scan_range).await?;
+    let block_meta = download_blocks(client, wallet_dir, db_cache, &scan_range).await?;
 
     // Fetch the prior block's chain state and scan.
     let result: anyhow::Result<()> = async {
@@ -108,7 +102,7 @@ pub async fn sync_one_batch(
     delete_cached_blocks(name, wallet_dir, db_cache, &block_meta);
     result?;
 
-    Ok(BatchOutcome { worked: true })
+    Ok(true)
 }
 
 /// Scan cached blocks, recovering in place when librustzcash reports that the
@@ -117,14 +111,14 @@ pub async fn sync_one_batch(
 /// application policy, copied from zecd's bounded one-batch sync engine.
 fn scan_or_rewind(
     name: &str,
-    params: &ZNetwork,
+    params: ZNetwork,
     db_cache: &mut FsBlockDb,
     db_data: &mut WriteDb,
     start: BlockHeight,
     chain_state: &zcash_client_backend::data_api::chain::ChainState,
     limit: usize,
 ) -> anyhow::Result<()> {
-    match scan_cached_blocks(params, db_cache, db_data, start, chain_state, limit) {
+    match scan_cached_blocks(&params, db_cache, db_data, start, chain_state, limit) {
         Ok(_) => Ok(()),
         Err(ChainError::Scan(error)) if error.is_continuity_error() => {
             let requested = error.at_height().saturating_sub(10);
@@ -169,7 +163,6 @@ fn rewind_wallet(
 
 /// Download compact blocks for a scan range and write them to the block cache.
 async fn download_blocks(
-    _name: &str,
     client: &mut LwdClient,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,

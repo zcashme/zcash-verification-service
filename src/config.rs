@@ -63,7 +63,7 @@ pub struct AppConfig {
 
 impl AppConfig {
     /// Default LWD URL for a given network.
-    pub fn default_lwd_url(network: &ZNetwork) -> String {
+    pub fn default_lwd_url(network: ZNetwork) -> String {
         match network {
             ZNetwork::Main => LWD_DEFAULT_URL_MAIN.to_string(),
             ZNetwork::Test | ZNetwork::Regtest(_) => LWD_DEFAULT_URL_TEST.to_string(),
@@ -237,7 +237,7 @@ impl AppConfig {
         let lwd_url = cli
             .lwd_url
             .clone()
-            .unwrap_or_else(|| AppConfig::default_lwd_url(&network));
+            .unwrap_or_else(|| AppConfig::default_lwd_url(network));
 
         Ok(AppConfig {
             network,

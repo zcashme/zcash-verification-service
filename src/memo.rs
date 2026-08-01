@@ -3,13 +3,13 @@
 //! A ZFA authentication memo is UTF-8 text followed by NUL padding:
 //!
 //! ```text
-//! DO NOT MODIFY:{zvs/1234567890123456[,return-address]}
+//! DO NOT MODIFY:{zvs/1234567890123456,return-address}
 //! ```
 //!
 //! This module deliberately validates only the wire-format boundary. The
-//! worker validates an optional return address against its configured Zcash
-//! network immediately before constructing an OTP response; keeping that
-//! operation there preserves the exact encoded address for the HMAC message.
+//! worker validates the return address against its configured Zcash network
+//! immediately before constructing an OTP response; keeping that operation
+//! there preserves the exact encoded address for the HMAC message.
 
 /// The length of a Zcash memo field in bytes.
 pub const MEMO_LEN: usize = 512;
@@ -24,12 +24,12 @@ const PREFIX: &[u8] = b"DO NOT MODIFY:{zvs/";
 pub struct ParsedMemo {
     /// Exactly sixteen ASCII decimal digits.
     pub session_id: String,
-    /// The exact encoded return address supplied by the payer, if present.
+    /// The exact encoded return address supplied by the payer.
     ///
     /// It is intentionally not normalized: this exact string is an input to
     /// the OTP HMAC and must match the consumer application's value byte for
     /// byte.
-    pub return_address: Option<String>,
+    pub return_address: String,
 }
 
 /// Parse a full Zcash memo as a ZFA authentication payload.
@@ -50,25 +50,21 @@ pub fn parse_memo(memo: &[u8]) -> Option<ParsedMemo> {
 
     let content = payload.strip_prefix(PREFIX)?.strip_suffix(b"}")?;
     let (session_id, return_address) = match content.iter().position(|&byte| byte == b',') {
-        Some(comma) => (&content[..comma], Some(&content[comma + 1..])),
-        None => (content, None),
+        Some(comma) => (&content[..comma], &content[comma + 1..]),
+        None => return None, // return address is required
     };
 
     if session_id.len() != SESSION_ID_LEN || !session_id.iter().all(u8::is_ascii_digit) {
         return None;
     }
 
-    let return_address = match return_address {
-        Some(address) if !address.is_empty() && !address.contains(&b',') => {
-            Some(std::str::from_utf8(address).ok()?.to_owned())
-        }
-        Some(_) => return None,
-        None => None,
-    };
+    if return_address.is_empty() || return_address.contains(&b',') {
+        return None;
+    }
 
     Some(ParsedMemo {
         session_id: std::str::from_utf8(session_id).ok()?.to_owned(),
-        return_address,
+        return_address: std::str::from_utf8(return_address).ok()?.to_owned(),
     })
 }
 
@@ -84,15 +80,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_session_without_return_address() {
+    fn rejects_missing_return_address() {
         let memo = memo_with("DO NOT MODIFY:{zvs/1234567890123456}");
-        assert_eq!(
-            parse_memo(&memo),
-            Some(ParsedMemo {
-                session_id: "1234567890123456".to_owned(),
-                return_address: None,
-            })
-        );
+        assert!(parse_memo(&memo).is_none());
     }
 
     #[test]
@@ -100,10 +90,7 @@ mod tests {
         let memo = memo_with("DO NOT MODIFY:{zvs/1234567890123456,u1example-return-address}");
         let parsed = parse_memo(&memo).expect("valid payload");
         assert_eq!(parsed.session_id, "1234567890123456");
-        assert_eq!(
-            parsed.return_address.as_deref(),
-            Some("u1example-return-address")
-        );
+        assert_eq!(parsed.return_address, "u1example-return-address");
     }
 
     #[test]
@@ -124,7 +111,7 @@ mod tests {
 
     #[test]
     fn rejects_interior_nul_and_wrong_memo_length() {
-        let mut memo = memo_with("DO NOT MODIFY:{zvs/1234567890123456}");
+        let mut memo = memo_with("DO NOT MODIFY:{zvs/1234567890123456,u1return}");
         memo[24] = 0;
         assert!(parse_memo(&memo).is_none());
         assert!(parse_memo(b"too short").is_none());

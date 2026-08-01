@@ -51,16 +51,8 @@ impl SeedKeeper {
         SeedKeeper { seed: None }
     }
 
-    pub fn lock(&mut self) {
-        self.seed = None;
-    }
-
     pub fn set(&mut self, seed: SecretVec<u8>) {
         self.seed = Some(MlockedSecret::new(seed));
-    }
-
-    pub fn is_unlocked(&self) -> bool {
-        self.seed.is_some()
     }
 
     /// A copy of the decrypted seed, if loaded — for recreating the wallet

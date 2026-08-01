@@ -240,15 +240,15 @@ impl WalletActor {
                 match sync_engine::sync_one_batch(
                     "zfa",
                     client,
-                    &self.network,
+                    self.network,
                     &self.wallet_dir,
                     &mut self.db_cache,
                     &mut self.db_data,
                 )
                 .await
                 {
-                    Ok(outcome) => {
-                        if !outcome.worked {
+                    Ok(worked) => {
+                        if !worked {
                             break; // caught up
                         }
                     }
@@ -404,7 +404,7 @@ impl WalletActor {
                 continue;
             }
 
-            if let Err(e) = self.parse_return_address(&payment.return_address) {
+            if let Err(e) = parse_return_address(self.network, &payment.return_address) {
                 tracing::debug!(txid = %payment.incoming_txid, "[zfa] ignored invalid return address: {e}");
                 continue;
             }
@@ -510,7 +510,7 @@ impl WalletActor {
         otp_code: &str,
     ) -> anyhow::Result<TxId> {
         let account_id = self.account_id;
-        let zaddr = self.parse_return_address(recipient_address)?;
+        let zaddr = parse_return_address(self.network, recipient_address)?;
 
         let memo_str = format!("(ZFA OTP){otp_code}");
         let mut memo_bytes = [0u8; 512];
@@ -658,22 +658,23 @@ impl WalletActor {
         Ok(())
     }
 
-    /// Parse an exact return-address string and require a shielded receiver on
-    /// this worker's network. `ZcashAddress::convert_if_network` is the
-    /// upstream network validation boundary; `Payment::new` then enforces that
-    /// the selected recipient can carry a memo.
-    fn parse_return_address(&self, encoded: &str) -> anyhow::Result<zcash_address::ZcashAddress> {
-        let address = zcash_address::ZcashAddress::try_from_encoded(encoded)
-            .map_err(|e| anyhow::anyhow!("invalid return address: {e}"))?;
-        if !address.can_receive_memo() {
-            anyhow::bail!("return address has no shielded receiver for the OTP memo");
-        }
-        address
-            .clone()
-            .convert_if_network::<zcash_keys::address::Address>(self.network.network_type())
-            .map_err(|e| anyhow::anyhow!("return address is for another network: {e}"))?;
-        Ok(address)
+}
+
+/// Parse an exact return-address string and require a shielded receiver on
+/// this worker's network. `ZcashAddress::convert_if_network` is the
+/// upstream network validation boundary; `Payment::new` then enforces that
+/// the selected recipient can carry a memo.
+fn parse_return_address(network: ZNetwork, encoded: &str) -> anyhow::Result<zcash_address::ZcashAddress> {
+    let address = zcash_address::ZcashAddress::try_from_encoded(encoded)
+        .map_err(|e| anyhow::anyhow!("invalid return address: {e}"))?;
+    if !address.can_receive_memo() {
+        anyhow::bail!("return address has no shielded receiver for the OTP memo");
     }
+    address
+        .clone()
+        .convert_if_network::<zcash_keys::address::Address>(network.network_type())
+        .map_err(|e| anyhow::anyhow!("return address is for another network: {e}"))?;
+    Ok(address)
 }
 
 /// Typed data retained from one incoming decrypted shielded note.
@@ -697,13 +698,10 @@ fn collect_incoming_from_pool<Note>(
         let Some(parsed) = memo::parse_memo(output.memo().as_array()) else {
             continue;
         };
-        let Some(return_address) = parsed.return_address else {
-            continue;
-        };
         payments.push(IncomingAuthPayment {
             incoming_txid,
             session_id: parsed.session_id,
-            return_address,
+            return_address: parsed.return_address,
             amount_zats: note_value(output.note()),
         });
     }

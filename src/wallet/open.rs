@@ -22,8 +22,6 @@ const BLOCKS_FOLDER: &str = "blocks";
 
 /// A read/write wallet handle (uses a real clock + OS RNG, required for writes).
 pub type WriteDb = WalletDb<rusqlite::Connection, ZNetwork, SystemClock, OsRng>;
-/// A read-only wallet handle (no clock/RNG needed).
-pub type ReadDb = WalletDb<rusqlite::Connection, ZNetwork, (), ()>;
 
 pub fn data_db_path(wallet_dir: &Path) -> PathBuf {
     wallet_dir.join(DATA_DB)
@@ -73,16 +71,6 @@ fn restrict_wallet_db_permissions(_path: &Path) -> anyhow::Result<()> {
 fn configure_writer_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     rusqlite::vtab::array::load_module(conn)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-}
-
-/// Open the wallet DB read-only (balances, history); short-lived per request.
-pub fn open_read(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<ReadDb> {
-    Ok(WalletDb::for_path(
-        data_db_path(wallet_dir),
-        network,
-        (),
-        (),
-    )?)
 }
 
 /// Open the compact-block cache.

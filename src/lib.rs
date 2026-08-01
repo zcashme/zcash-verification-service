@@ -47,7 +47,6 @@ pub mod otp;
 pub mod response_ledger;
 pub mod sync;
 pub mod wallet;
-pub mod watcher;
 
 use tracing::info;
 
@@ -68,7 +67,7 @@ pub async fn init_wallet(
     };
     use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 
-    if wallet::store::WalletStore::exists(&config.seed_path) {
+    if wallet::store::WalletStore::exists(&config.seed_path)? {
         anyhow::bail!(
             "wallet already initialized ({} has a [seed] table)",
             config.seed_path.display()
@@ -249,7 +248,7 @@ pub async fn run(config: config::AppConfig, init_args: config::InitArgs) -> anyh
     );
 
     // If the wallet hasn't been initialized yet, create it now.
-    if !wallet::store::WalletStore::exists(&config.seed_path) {
+    if !wallet::store::WalletStore::exists(&config.seed_path)? {
         info!("wallet not initialized — creating now");
         init_wallet(&config, &init_args).await?;
         info!("wallet initialized — starting worker");

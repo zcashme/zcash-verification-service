@@ -26,11 +26,8 @@ pub struct WalletStore {
 /// The on-disk `[seed]` table, read from a TOML file.
 impl WalletStore {
     /// True if a `[seed]` table exists in the config file at `path`.
-    pub fn exists(path: &Path) -> bool {
-        match ConfigFile::read(path) {
-            Ok(cfg) => cfg.seed.is_some(),
-            Err(_) => false,
-        }
+    pub fn exists(path: &Path) -> anyhow::Result<bool> {
+        Ok(ConfigFile::read(path)?.seed.is_some())
     }
 
     /// Write a new `[seed]` table to `path` with the mnemonic encrypted to the
