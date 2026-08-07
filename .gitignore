@@ -2,3 +2,7 @@ target/
 target/
 target/
 zfa-backend-mainnet.tar.gz
+zvs_data/
+zfa-data/
+.env
+seed.txt
