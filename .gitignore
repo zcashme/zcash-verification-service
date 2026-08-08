@@ -6,3 +6,4 @@ zvs_data/
 zfa-data/
 .env
 seed.txt
+node_modules
