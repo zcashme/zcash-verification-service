@@ -1,0 +1,54 @@
+{
+  "name": "@zcashme/auth",
+  "version": "0.1.0",
+  "description": "ZcashMe login SDK — OIDC client and React components",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.mjs",
+      "require": "./dist/react.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts src/react.tsx --format cjs,esm --dts --external react",
+    "dev": "tsup src/index.ts src/react.tsx --format cjs,esm --dts --external react --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["zcash", "oidc", "oauth", "auth", "login", "sdk"],
+  "author": "ZcashMe",
+  "license": "ISC",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "@types/react": "^19.1.9",
+    "react": "^19.1.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.2"
+  }
+}
