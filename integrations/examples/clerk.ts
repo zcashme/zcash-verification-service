@@ -1,24 +1,25 @@
 /**
  * Clerk integration for ZcashMe.
  *
- * Clerk uses a dashboard UI for custom OIDC providers — no code config.
- * This file documents the setup steps and includes a proxy for user_id.
+ * Clerk uses a dashboard UI for custom OIDC providers — no code configuration required.
+ * This file documents the setup steps and includes a proxy for forwarding custom `user_id` params.
  *
  * Setup (Dashboard):
- *   1. SSO Connections → Add connection → Custom provider
+ *   1. SSO Connections → Add connection → For all users → Custom provider
  *   2. Name: ZcashMe, Key: zcashme
  *   3. Discovery Endpoint: https://auth.zcash.me/.well-known/openid-configuration
- *   4. Client ID: pgpz, Client Secret: (leave empty)
- *   5. Enable PKCE: ✅
- *   6. Copy the Authorized redirect URL → add to ZcashMe auth service
- *   7. Enable connection
+ *   4. Client ID: your-client-id (e.g. 'pgpz')
+ *   5. Enable PKCE toggle: ✅
+ *   6. Client Secret: leave empty (PKCE only)
+ *   7. Copy the Authorized redirect URL → submit it as a redirect URI in the ZcashMe auth service
  *
  * Attribute Mapping (Dashboard):
- *   User ID        → sub
- *   First name      → name
- *   Profile image   → picture
+ *   - Standard OIDC claims (sub, name, preferred_username, picture) are auto-mapped.
+ *   - Custom claim zcash_unified_address needs manual mapping.
  *
- * user_id: Clerk doesn't support custom auth params. Use a proxy:
+ * user_id Parameter:
+ *   Clerk doesn't support custom authorization parameters natively.
+ *   If your app needs user_id, use a proxy (see below).
  */
 
 // ── Proxy for user_id (Cloudflare Worker / Hono) ─────────
@@ -36,8 +37,8 @@ app.get("/auth", (c) => {
   const url = new URL("https://auth.zcash.me/auth");
 
   // Copy all params Clerk sends
-  const params = new URLSearchParams(c.req.url.split("?")[1] || "");
-  params.forEach((value, key) => url.searchParams.set(key, value));
+  const requestUrl = new URL(c.req.url);
+  requestUrl.searchParams.forEach((value, key) => url.searchParams.set(key, value));
 
   // Add user_id — generate or look up your app's identifier
   url.searchParams.set("user_id", "PGPZ-A3F2B1");
