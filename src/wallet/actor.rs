@@ -48,6 +48,10 @@ const MIN_SPLIT_OUTPUT_VALUE: u64 = 500_000; // 0.005 ZEC — covers ~8 OTP resp
 const MIN_AUTH_PAYMENT: u64 = 200_000;
 /// Fixed OTP response amount, retained from the original worker.
 const OTP_RESPONSE_AMOUNT: u64 = 50_000;
+/// If nothing arrives on the mempool stream for this long, assume the
+/// connection is dead and reconnect. Zcash blocks arrive every ~75s and each
+/// one ends the stream, so a healthy stream is never this quiet.
+const MEMPOOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Parameters needed to launch the wallet actor.
 pub struct ActorConfig {
@@ -281,10 +285,21 @@ impl WalletActor {
             let Some(client) = self.client.as_mut() else {
                 continue;
             };
-            let stream = match client.get_mempool_stream().await {
-                Ok(s) => s,
-                Err(e) => {
+            let stream = match tokio::time::timeout(
+                Duration::from_secs(30),
+                client.get_mempool_stream(),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
                     warn!("[zfa] failed to open mempool stream: {e}");
+                    self.client = None;
+                    tokio::time::sleep(self.sync_interval).await;
+                    continue;
+                }
+                Err(_) => {
+                    warn!("[zfa] timed out opening mempool stream");
                     self.client = None;
                     tokio::time::sleep(self.sync_interval).await;
                     continue;
@@ -316,6 +331,18 @@ impl WalletActor {
                             }
                         }
                     }
+                    // Belt-and-suspenders watchdog: keepalive pings normally
+                    // surface a dead connection as a stream error, but if
+                    // anything slips through (e.g. a server-side hang) we
+                    // detect total silence here instead of parking forever.
+                    _ = tokio::time::sleep(MEMPOOL_IDLE_TIMEOUT) => {
+                        warn!(
+                            "[zfa] mempool stream idle for {:?}; assuming dead, reconnecting",
+                            MEMPOOL_IDLE_TIMEOUT
+                        );
+                        self.client = None;
+                        break;
+                    }
                 }
             }
 
@@ -344,7 +371,9 @@ impl WalletActor {
             .client
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("not connected"))?;
-        let tip = client.get_latest_block().await?;
+        let tip = tokio::time::timeout(Duration::from_secs(30), client.get_latest_block())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out fetching chain tip"))??;
         let height = u32::try_from(tip.height)
             .map_err(|_| anyhow::anyhow!("lightwalletd returned an out-of-range chain height"))?;
         if self.tip_height != Some(height) {

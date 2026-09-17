@@ -15,6 +15,8 @@
 //! | `GetTreeState` | Birthday anchor / chain state |
 //! | `SendTransaction` | Broadcast OTP response transaction |
 
+use std::time::Duration;
+
 use anyhow::Context;
 use tracing::info;
 
@@ -46,6 +48,18 @@ impl LwdClient {
         } else {
             endpoint
         };
+
+        // HTTP/2 keepalive: without pings, a silently-dropped connection (NAT
+        // or load-balancer idle timeout) is indistinguishable from an idle
+        // stream, and RPCs parked on it hang forever. Ping every 30s; if a
+        // ping isn't acked within 20s the channel errors out, which callers
+        // handle as a normal connection failure and reconnect.
+        let endpoint = endpoint
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(20))
+            // Mempool streams are idle between transactions; keep pinging
+            // even when there's no in-flight request.
+            .keep_alive_while_idle(true);
 
         let channel = endpoint
             .connect()
