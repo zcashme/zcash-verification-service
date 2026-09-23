@@ -37,6 +37,12 @@ pub const RECONNECT_MAX_SECS: u64 = 60;
 /// Per-attempt LWD connect timeout.
 pub const CONNECT_TIMEOUT_SECS: u64 = 10;
 
+/// Chain source selected at compile time (`lwd` default, `zebra-indexer`).
+#[cfg(feature = "lwd")]
+pub const CHAIN_SOURCE: &str = "lwd";
+#[cfg(feature = "zebra-indexer")]
+pub const CHAIN_SOURCE: &str = "zebra-indexer";
+
 /// Default data directory.
 pub const DEFAULT_DATADIR: &str = "./zfa-data";
 
