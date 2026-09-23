@@ -30,7 +30,7 @@ use zcash_protocol::value::Zatoshis;
 use zcash_protocol::TxId;
 
 use crate::backoff::Backoff;
-use crate::lwd::LwdClient;
+use crate::chain::ChainClient;
 use crate::memo;
 use crate::network::ZNetwork;
 use crate::otp;
@@ -149,7 +149,7 @@ async fn ensure_account(
     let prior = u32::from(store.birthday);
 
     let mut client =
-        tokio::time::timeout(Duration::from_secs(30), LwdClient::connect(&cfg.lwd_url))
+        tokio::time::timeout(Duration::from_secs(30), crate::chain::connect_lwd(&cfg.lwd_url))
             .await
             .map_err(|_| anyhow::anyhow!("timed out connecting for bootstrap"))??;
 
@@ -183,7 +183,7 @@ pub struct WalletActor {
     account_id: zcash_client_sqlite::AccountUuid,
     prover: LocalTxProver,
     lwd_url: String,
-    client: Option<LwdClient>,
+    client: Option<Box<dyn ChainClient>>,
     tip_height: Option<u32>,
     backoff: Backoff,
     sync_interval: Duration,
@@ -358,7 +358,7 @@ impl WalletActor {
 
     async fn connect(&mut self) -> anyhow::Result<()> {
         info!("[zfa] connecting to lightwalletd: {}", self.lwd_url);
-        let client = tokio::time::timeout(self.connect_timeout, LwdClient::connect(&self.lwd_url))
+        let client = tokio::time::timeout(self.connect_timeout, crate::chain::connect_lwd(&self.lwd_url))
             .await
             .map_err(|_| anyhow::anyhow!("connect timed out after {:?}", self.connect_timeout))??;
         self.client = Some(client);

@@ -40,13 +40,13 @@ pub mod config;
 pub mod error;
 pub mod hardening;
 pub mod lock;
-pub mod lwd;
 pub mod memo;
 pub mod network;
 pub mod otp;
 pub mod response_ledger;
 pub mod sync;
 pub mod wallet;
+pub mod chain;
 
 use tracing::info;
 
