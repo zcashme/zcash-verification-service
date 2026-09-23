@@ -1,49 +1,23 @@
 //! In-memory custody of the decrypted wallet seed and on-demand spending-key
 //! derivation.
 //!
-//! The seed is held as a zeroizing secret in mlock'd memory and never
-//! persisted in the clear. The Unified Spending Key is derived fresh per
-//! operation and never cached. The OTP HMAC key is derived from the seed and
-//! held the same way.
+//! The seed is held as a zeroizing secret and never persisted in the clear.
+//! The Unified Spending Key is derived fresh per operation and never cached.
+//! The OTP HMAC key is derived from the seed and held the same way.
 
 use std::path::Path;
 
 use secrecy::{ExposeSecret, SecretVec};
 use zcash_keys::keys::UnifiedSpendingKey;
 
-use crate::hardening;
 use crate::network::ZNetwork;
 use crate::wallet::store::WalletStore;
-
-/// The decrypted seed held in mlock'd memory: pinned into RAM (best-effort)
-/// so it is never written to swap, and zeroized + munlocked on drop.
-struct MlockedSecret {
-    seed: SecretVec<u8>,
-    locked: bool,
-}
-
-impl MlockedSecret {
-    fn new(seed: SecretVec<u8>) -> Self {
-        let locked = hardening::lock_secret(seed.expose_secret());
-        MlockedSecret { seed, locked }
-    }
-
-    fn expose(&self) -> &[u8] {
-        self.seed.expose_secret()
-    }
-}
-
-impl Drop for MlockedSecret {
-    fn drop(&mut self) {
-        hardening::unlock_secret(self.seed.expose_secret(), self.locked);
-    }
-}
 
 /// Holds the decrypted seed (when unlocked). Sending (OTP response transactions)
 /// requires this to be unlocked.
 #[derive(Default)]
 pub struct SeedKeeper {
-    seed: Option<MlockedSecret>,
+    seed: Option<SecretVec<u8>>,
 }
 
 impl SeedKeeper {
@@ -52,7 +26,7 @@ impl SeedKeeper {
     }
 
     pub fn set(&mut self, seed: SecretVec<u8>) {
-        self.seed = Some(MlockedSecret::new(seed));
+        self.seed = Some(seed);
     }
 
     /// A copy of the decrypted seed, if loaded — for recreating the wallet
@@ -60,7 +34,7 @@ impl SeedKeeper {
     pub fn clone_seed(&self) -> Option<SecretVec<u8>> {
         self.seed
             .as_ref()
-            .map(|s| SecretVec::new(s.expose().to_vec()))
+            .map(|s| SecretVec::new(s.expose_secret().to_vec()))
     }
 
     /// Derive the Unified Spending Key for an account index, or an error if the
@@ -74,7 +48,7 @@ impl SeedKeeper {
             .seed
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("wallet is locked — seed not loaded"))?;
-        UnifiedSpendingKey::from_seed(&network, seed.expose(), account_index)
+        UnifiedSpendingKey::from_seed(&network, seed.expose_secret(), account_index)
             .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))
     }
 
@@ -82,26 +56,23 @@ impl SeedKeeper {
     pub fn derive_otp_key(&self) -> Option<SecretVec<u8>> {
         self.seed
             .as_ref()
-            .map(|s| crate::config::derive_otp_key(s.expose()))
+            .map(|s| crate::config::derive_otp_key(s.expose_secret()))
     }
 }
 
-/// The HMAC key shared with consumer application servers. Like the wallet
-/// seed, it is zeroized by `SecretVec` and best-effort mlocked for its full
-/// in-process lifetime. It has no `Debug` or `Display` implementation.
+/// The HMAC key shared with consumer application servers. It is zeroized by
+/// `SecretVec` and has no `Debug` or `Display` implementation.
 pub struct OtpSecret {
-    secret: MlockedSecret,
+    secret: SecretVec<u8>,
 }
 
 impl OtpSecret {
     pub fn new(secret: SecretVec<u8>) -> Self {
-        OtpSecret {
-            secret: MlockedSecret::new(secret),
-        }
+        OtpSecret { secret }
     }
 
     pub fn expose(&self) -> &[u8] {
-        self.secret.expose()
+        self.secret.expose_secret()
     }
 }
 

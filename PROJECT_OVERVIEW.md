@@ -41,21 +41,20 @@ verifies OTP locally            response txid          decrypts + sends OTP resp
 - **gRPC:** `tonic` (TLS via native roots) talking to lightwalletd/Zaino.
 - **Storage:** SQLite — `data.sqlite` (wallet DB, owned by `zcash_client_sqlite`),
   `responses.sqlite` (worker-local response ledger), plus a compact-block cache.
-- **Key custody:** `age` encryption for the on-disk seed, `secrecy` + `mlock` for
-  in-memory secrets, `bip0039` for the mnemonic.
+- **Key custody:** `age` encryption for the on-disk seed, `secrecy` for in-memory
+  secrets, `bip0039` for the mnemonic.
 - **OTP:** `hmac` + `sha2` + `subtle` (constant-time compare).
 
 ## Directory layout
 
 ```
 src/
-  main.rs            CLI entry point; resolves config, hardens process, locks datadir
+  main.rs            CLI entry point; resolves config and locks datadir
   lib.rs             init_wallet + run() (spawns the wallet actor)
   config.rs          CLI flags, hardcoded operational defaults, OTP key derivation
   network.rs         ZNetwork (main/test/regtest) implementing zcash Parameters
   otp.rs             deterministic 6-digit OTP generation + constant-time verify
   memo.rs            strict 512-byte ZFA memo parser
-  hardening.rs       process hardening: no core dumps, non-dumpable, mlock
   lock.rs            single-instance datadir lock (host-local advisory lock)
   lwd.rs             thin lightwalletd/Zaino gRPC client wrapper
   sync.rs            block sync + reorg recovery (scan_cached_blocks)
@@ -92,7 +91,6 @@ encrypted seed. CLI flags override a few values.
 | Env | Purpose |
 |-----|---------|
 | `RUST_LOG` | Log level (default: `info`) |
-| `ZFA_ALLOW_CORE_DUMPS` | `1` to disable core-dump suppression |
 | `ZFA_REGTEST_NU63_HEIGHT` | NU6.3 activation height for regtest |
 
 ## Key management
@@ -102,8 +100,8 @@ encrypted seed. CLI flags override a few values.
 - The seed is stored **age-encrypted** (not password-protected) in `zfa.toml`;
   an age identity file (`identity.txt`) opens it. Two separate files — getting one
   alone does not unlock the seed.
-- In memory the seed is pinned with `mlock` and zeroized on drop. The Unified
-  Spending Key is derived fresh per operation and never cached.
+- In memory the seed is held in a zeroizing `SecretVec`. The Unified Spending
+  Key is derived fresh per operation and never cached.
 - At startup the worker verifies the seed-derived UFVK matches the wallet DB's
   account UFVK; a mismatch means the DB was swapped and the worker refuses to start.
 
@@ -133,7 +131,7 @@ encrypted seed. CLI flags override a few values.
 ## Testing
 
 - Unit tests in each module (memo parsing, OTP vectors, ledger state machine,
-  backoff, lock, hardening).
+  backoff, lock).
 - Two regtest end-to-end tests (`tests/`) that spin up zebrad + lightwalletd +
   zallet + the worker. They skip unless `ZEBRAD_BIN`, `LIGHTWALLETD_BIN`, and
   `ZALLET_BIN` are set.

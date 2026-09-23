@@ -49,7 +49,6 @@ Restore from an existing mnemonic:
 | Env | Purpose |
 |-----|---------|
 | `RUST_LOG` | Log level (default: `info`) |
-| `ZFA_ALLOW_CORE_DUMPS` | `1` to disable core-dump suppression |
 | `ZFA_REGTEST_NU63_HEIGHT` | NU6.3 activation height for regtest |
 
 ## Keys

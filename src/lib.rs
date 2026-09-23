@@ -37,7 +37,6 @@
 
 pub mod backoff;
 pub mod config;
-pub mod hardening;
 pub mod lock;
 pub mod memo;
 pub mod network;
