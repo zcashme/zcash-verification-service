@@ -24,9 +24,18 @@ pub const ACCOUNT_INDEX: u32 = 0;
 pub const ACCOUNT_NAME: &str = "primary";
 
 /// Default lightwalletd gRPC endpoint (mainnet) — zec.rocks public instance.
+#[cfg(feature = "lwd")]
 pub const LWD_DEFAULT_URL_MAIN: &str = "https://zec.rocks:443";
 /// Default lightwalletd gRPC endpoint (testnet) — zec.rocks public testnet instance.
+#[cfg(feature = "lwd")]
 pub const LWD_DEFAULT_URL_TEST: &str = "https://testnet.zec.rocks:443";
+
+/// Default local Zebra indexer gRPC endpoint (mainnet).
+#[cfg(feature = "zebra-indexer")]
+pub const ZEBRA_DEFAULT_URL_MAIN: &str = "http://127.0.0.1:8230";
+/// Default local Zebra indexer gRPC endpoint (testnet).
+#[cfg(feature = "zebra-indexer")]
+pub const ZEBRA_DEFAULT_URL_TEST: &str = "http://127.0.0.1:18230";
 
 /// Sync poll interval.
 pub const SYNC_INTERVAL_SECS: u64 = 20;
@@ -56,8 +65,12 @@ pub struct AppConfig {
     pub network: ZNetwork,
     /// Data directory (wallet DB, response ledger, identity.txt, blocks/).
     pub datadir: PathBuf,
-    /// lightwalletd (or Zaino) gRPC endpoint URL.
+    /// lightwalletd gRPC endpoint URL.
+    #[cfg(feature = "lwd")]
     pub lwd_url: String,
+    /// Local Zebra indexer gRPC endpoint URL.
+    #[cfg(feature = "zebra-indexer")]
+    pub zebra_url: String,
     /// Path to the TOML file containing the `[seed]` table.
     pub conf_path: PathBuf,
     /// Path to the file containing the `[seed]` table (escape hatch: may differ
@@ -69,10 +82,32 @@ pub struct AppConfig {
 
 impl AppConfig {
     /// Default LWD URL for a given network.
+    #[cfg(feature = "lwd")]
     pub fn default_lwd_url(network: ZNetwork) -> String {
         match network {
             ZNetwork::Main => LWD_DEFAULT_URL_MAIN.to_string(),
             ZNetwork::Test | ZNetwork::Regtest(_) => LWD_DEFAULT_URL_TEST.to_string(),
+        }
+    }
+
+    /// Default local Zebra indexer URL for a given network.
+    #[cfg(feature = "zebra-indexer")]
+    pub fn default_zebra_url(network: ZNetwork) -> String {
+        match network {
+            ZNetwork::Main => ZEBRA_DEFAULT_URL_MAIN.to_string(),
+            ZNetwork::Test | ZNetwork::Regtest(_) => ZEBRA_DEFAULT_URL_TEST.to_string(),
+        }
+    }
+
+    /// Endpoint selected by the compile-time chain-source feature.
+    pub fn chain_url(&self) -> &str {
+        #[cfg(feature = "lwd")]
+        {
+            &self.lwd_url
+        }
+        #[cfg(feature = "zebra-indexer")]
+        {
+            &self.zebra_url
         }
     }
 
@@ -121,10 +156,17 @@ pub struct Cli {
     #[arg(long, value_name = "NET")]
     pub network: Option<String>,
 
-    /// lightwalletd (or Zaino) gRPC URL. Default: https://zec.rocks:443 (mainnet)
+    /// lightwalletd gRPC URL. Default: https://zec.rocks:443 (mainnet)
     /// or https://testnet.zec.rocks:443 (testnet).
+    #[cfg(feature = "lwd")]
     #[arg(long, value_name = "URL")]
     pub lwd_url: Option<String>,
+
+    /// Local Zebra indexer gRPC URL. Defaults to 127.0.0.1:8230 (mainnet)
+    /// or 127.0.0.1:18230 (testnet).
+    #[cfg(feature = "zebra-indexer")]
+    #[arg(long, value_name = "URL")]
+    pub zebra_url: Option<String>,
 
     /// Mnemonic phrase to restore from. If omitted, a fresh wallet is generated.
     #[arg(long, value_name = "PHRASE")]
@@ -239,16 +281,25 @@ impl AppConfig {
             ZNetwork::Main
         };
 
-        // LWD URL: CLI > default per network.
+        #[cfg(feature = "lwd")]
         let lwd_url = cli
             .lwd_url
             .clone()
             .unwrap_or_else(|| AppConfig::default_lwd_url(network));
 
+        #[cfg(feature = "zebra-indexer")]
+        let zebra_url = cli
+            .zebra_url
+            .clone()
+            .unwrap_or_else(|| AppConfig::default_zebra_url(network));
+
         Ok(AppConfig {
             network,
             datadir,
+            #[cfg(feature = "lwd")]
             lwd_url,
+            #[cfg(feature = "zebra-indexer")]
+            zebra_url,
             conf_path,
             seed_path,
             identity_path,

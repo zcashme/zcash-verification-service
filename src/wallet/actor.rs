@@ -30,8 +30,6 @@ use zcash_protocol::value::Zatoshis;
 use zcash_protocol::TxId;
 
 use crate::backoff::Backoff;
-use crate::chain::ChainClient;
-
 use crate::memo;
 use crate::network::ZNetwork;
 use crate::otp;
@@ -62,7 +60,7 @@ pub struct ActorConfig {
     pub seed_path: PathBuf,
     /// Path to the age identity file that decrypts the mnemonic.
     pub identity_path: PathBuf,
-    pub lwd_url: String,
+    pub chain_url: String,
     pub sync_interval: Duration,
     pub connect_timeout: Duration,
     pub reconnect_base: Duration,
@@ -112,7 +110,7 @@ pub async fn build(cfg: ActorConfig) -> anyhow::Result<WalletActor> {
         seed,
         account_id,
         prover,
-        lwd_url: cfg.lwd_url,
+        chain_url: cfg.chain_url,
         client: None,
         tip_height: None,
         backoff: Backoff::new(cfg.reconnect_base, cfg.reconnect_max),
@@ -150,7 +148,7 @@ async fn ensure_account(
     let prior = u32::from(store.birthday);
 
     let mut client =
-        tokio::time::timeout(Duration::from_secs(30), crate::chain::ChainClient::connect(&cfg.lwd_url))
+        tokio::time::timeout(Duration::from_secs(30), crate::chain::ChainClient::connect(&cfg.chain_url))
             .await
             .map_err(|_| anyhow::anyhow!("timed out connecting for bootstrap"))??;
 
@@ -183,7 +181,7 @@ pub struct WalletActor {
     seed: SeedKeeper,
     account_id: zcash_client_sqlite::AccountUuid,
     prover: LocalTxProver,
-    lwd_url: String,
+    chain_url: String,
     client: Option<crate::chain::ChainClient>,
     tip_height: Option<u32>,
     backoff: Backoff,
@@ -358,8 +356,8 @@ impl WalletActor {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        info!("[zfa] connecting to lightwalletd: {}", self.lwd_url);
-        let client = tokio::time::timeout(self.connect_timeout, crate::chain::ChainClient::connect(&self.lwd_url))
+        info!("[zfa] connecting to {}: {}", crate::config::CHAIN_SOURCE, self.chain_url);
+        let client = tokio::time::timeout(self.connect_timeout, crate::chain::ChainClient::connect(&self.chain_url))
             .await
             .map_err(|_| anyhow::anyhow!("connect timed out after {:?}", self.connect_timeout))??;
         self.client = Some(client);

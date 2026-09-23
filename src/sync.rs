@@ -23,7 +23,6 @@ use zcash_client_sqlite::chain::BlockMeta;
 use zcash_client_sqlite::{error::SqliteClientError, FsBlockDb};
 use zcash_protocol::consensus::BlockHeight;
 
-use crate::chain::ChainClient;
 use crate::network::ZNetwork;
 use crate::wallet::open::{block_path, WriteDb};
 
