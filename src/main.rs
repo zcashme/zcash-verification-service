@@ -9,8 +9,6 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::resolve(&cli)?;
     zfa_backend::config::init_tracing();
-    let _datadir_lock = zfa_backend::lock::lock_datadir(&config.datadir)?;
-
     let init_args = InitArgs {
         mnemonic: cli.mnemonic,
         birthday: cli.birthday,

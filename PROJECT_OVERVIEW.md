@@ -49,13 +49,12 @@ verifies OTP locally            response txid          decrypts + sends OTP resp
 
 ```
 src/
-  main.rs            CLI entry point; resolves config and locks datadir
+  main.rs            CLI entry point; resolves config and starts the worker
   lib.rs             init_wallet + run() (spawns the wallet actor)
   config.rs          CLI flags, hardcoded operational defaults, OTP key derivation
   network.rs         ZNetwork (main/test/regtest) implementing zcash Parameters
   otp.rs             deterministic 6-digit OTP generation + constant-time verify
   memo.rs            strict 512-byte ZFA memo parser
-  lock.rs            single-instance datadir lock (host-local advisory lock)
   lwd.rs             thin lightwalletd/Zaino gRPC client wrapper
   sync.rs            block sync + reorg recovery (scan_cached_blocks)
   response_ledger.rs durable idempotence state machine for OTP responses
@@ -107,9 +106,7 @@ encrypted seed. CLI flags override a few values.
 
 ## Runtime behavior
 
-- **Single-writer actor:** one process owns the wallet DB. A host-local advisory
-  lock on `<datadir>/.lock` prevents a second worker on the same host (does **not**
-  span hosts — the datadir must be host-local).
+- **Single-writer actor:** one actor owns wallet DB writes within the worker process.
 - **Sync loop:** downloads compact blocks in batches (10,000) and scans them,
   with reorg recovery (rewind + truncate cache).
 - **Mempool watcher:** streams `GetMempoolStream`; the stream closes on each new

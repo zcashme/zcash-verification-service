@@ -967,16 +967,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fmutex"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bd990c8a95704647aeb7cc51b0ea54c5072c824894977cc8ba679459f00bc9a"
-dependencies = [
- "libc",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3925,15 +3915,6 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
-dependencies = [
- "windows-targets",
-]
-
-[[package]]
-name = "windows-sys"
 version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
@@ -4477,10 +4458,8 @@ dependencies = [
  "anyhow",
  "bip0039",
  "clap",
- "fmutex",
  "hex",
  "hmac 0.12.1",
- "libc",
  "orchard",
  "prost",
  "rand",
