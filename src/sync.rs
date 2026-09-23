@@ -23,7 +23,7 @@ use zcash_client_sqlite::chain::BlockMeta;
 use zcash_client_sqlite::{error::SqliteClientError, FsBlockDb};
 use zcash_protocol::consensus::BlockHeight;
 
-use crate::lwd::LwdClient;
+use crate::chain::ChainClient;
 use crate::network::ZNetwork;
 use crate::wallet::open::{block_path, WriteDb};
 
@@ -35,7 +35,7 @@ const BATCH_SIZE: u32 = 10_000;
 /// `false` if the wallet is caught up (no pending scan ranges).
 pub async fn sync_one_batch(
     name: &str,
-    client: &mut LwdClient,
+    client: &mut crate::chain::ChainClient,
     params: ZNetwork,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
@@ -163,7 +163,7 @@ fn rewind_wallet(
 
 /// Download compact blocks for a scan range and write them to the block cache.
 async fn download_blocks(
-    client: &mut LwdClient,
+    client: &mut crate::chain::ChainClient,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
     scan_range: &ScanRange,

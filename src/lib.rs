@@ -46,7 +46,8 @@ pub mod otp;
 pub mod response_ledger;
 pub mod sync;
 pub mod wallet;
-pub mod chain;
+pub mod chain; // framework kept, not active until adapter ready
+
 
 use tracing::info;
 
@@ -119,7 +120,7 @@ pub async fn init_wallet(
     // A fresh wallet has no prior funds, so its birthday is the current tip.
     // A restored wallet must receive an explicit, conservative birthday so it
     // never silently skips pre-existing auth payments or funds.
-    let mut bootstrap_client = lwd::LwdClient::connect(&config.lwd_url).await?;
+    let mut bootstrap_client = crate::chain::ChainClient::connect(&config.lwd_url).await?;
     let birthday_height = match args.birthday {
         Some(0) => anyhow::bail!("wallet birthday must be at least height 1"),
         Some(height) => zcash_protocol::consensus::BlockHeight::from_u32(height),
