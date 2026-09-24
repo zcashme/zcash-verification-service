@@ -8,6 +8,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
@@ -147,10 +148,12 @@ async fn ensure_account(
     // height. We must do the same — not subtract 1.
     let prior = u32::from(store.birthday);
 
-    let mut client =
-        tokio::time::timeout(Duration::from_secs(30), crate::chain::ChainClient::connect(&cfg.chain_url))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out connecting for bootstrap"))??;
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(30),
+        crate::chain::ChainClient::connect(&cfg.chain_url, cfg.network),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out connecting for bootstrap"))??;
 
     let tree_state = tokio::time::timeout(
         Duration::from_secs(30),
@@ -284,26 +287,24 @@ impl WalletActor {
             let Some(client) = self.client.as_mut() else {
                 continue;
             };
-            let stream = match tokio::time::timeout(
-                Duration::from_secs(30),
-                client.get_mempool_stream(),
-            )
-            .await
-            {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    warn!("[zfa] failed to open mempool stream: {e}");
-                    self.client = None;
-                    tokio::time::sleep(self.sync_interval).await;
-                    continue;
-                }
-                Err(_) => {
-                    warn!("[zfa] timed out opening mempool stream");
-                    self.client = None;
-                    tokio::time::sleep(self.sync_interval).await;
-                    continue;
-                }
-            };
+            let stream =
+                match tokio::time::timeout(Duration::from_secs(30), client.get_mempool_stream())
+                    .await
+                {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        warn!("[zfa] failed to open mempool stream: {e}");
+                        self.client = None;
+                        tokio::time::sleep(self.sync_interval).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        warn!("[zfa] timed out opening mempool stream");
+                        self.client = None;
+                        tokio::time::sleep(self.sync_interval).await;
+                        continue;
+                    }
+                };
             info!("[zfa] mempool stream opened");
 
             let mut stream = stream;
@@ -314,16 +315,16 @@ impl WalletActor {
                         info!("[zfa] shutdown during mempool watch");
                         return;
                     }
-                    msg = stream.message() => {
+                    msg = stream.next() => {
                         match msg {
-                            Ok(Some(raw_tx)) => {
+                            Some(Ok(raw_tx)) => {
                                 self.process_mempool_tx(&mut response_ledger, raw_tx).await;
                             }
-                            Ok(None) => {
+                            None => {
                                 info!("[zfa] mempool stream closed (new block)");
                                 break;
                             }
-                            Err(e) => {
+                            Some(Err(e)) => {
                                 warn!("[zfa] mempool stream error: {e}");
                                 self.client = None;
                                 break;
@@ -356,10 +357,17 @@ impl WalletActor {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        info!("[zfa] connecting to {}: {}", crate::config::CHAIN_SOURCE, self.chain_url);
-        let client = tokio::time::timeout(self.connect_timeout, crate::chain::ChainClient::connect(&self.chain_url))
-            .await
-            .map_err(|_| anyhow::anyhow!("connect timed out after {:?}", self.connect_timeout))??;
+        info!(
+            "[zfa] connecting to {}: {}",
+            crate::config::CHAIN_SOURCE,
+            self.chain_url
+        );
+        let client = tokio::time::timeout(
+            self.connect_timeout,
+            crate::chain::ChainClient::connect(&self.chain_url, self.network),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timed out after {:?}", self.connect_timeout))??;
         self.client = Some(client);
         self.backoff.reset();
         Ok(())
@@ -540,7 +548,7 @@ impl WalletActor {
         let account_id = self.account_id;
         let zaddr = parse_return_address(self.network, recipient_address)?;
 
-        let memo_str = format!("(ZFA OTP){otp_code}");
+        let memo_str = otp_code;
         let mut memo_bytes = [0u8; 512];
         memo_bytes[..memo_str.len()].copy_from_slice(memo_str.as_bytes());
         let memo = zcash_protocol::memo::MemoBytes::from_bytes(&memo_bytes)
@@ -685,14 +693,16 @@ impl WalletActor {
 
         Ok(())
     }
-
 }
 
 /// Parse an exact return-address string and require a shielded receiver on
 /// this worker's network. `ZcashAddress::convert_if_network` is the
 /// upstream network validation boundary; `Payment::new` then enforces that
 /// the selected recipient can carry a memo.
-fn parse_return_address(network: ZNetwork, encoded: &str) -> anyhow::Result<zcash_address::ZcashAddress> {
+fn parse_return_address(
+    network: ZNetwork,
+    encoded: &str,
+) -> anyhow::Result<zcash_address::ZcashAddress> {
     let address = zcash_address::ZcashAddress::try_from_encoded(encoded)
         .map_err(|e| anyhow::anyhow!("invalid return address: {e}"))?;
     if !address.can_receive_memo() {
