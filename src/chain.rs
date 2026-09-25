@@ -155,31 +155,7 @@ impl ChainClient {
     }
 
     pub async fn get_tree_state(&mut self, height: u64) -> anyhow::Result<TreeState> {
-        let response: serde_json::Value = self
-            .inner
-            .call("z_gettreestate", serde_json::json!([height.to_string()]))
-            .await
-            .context("z_gettreestate failed")?;
-
-        let final_tree_state = |pool: &str| -> anyhow::Result<String> {
-            response[pool]["commitments"]["finalState"]
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| anyhow!("z_gettreestate response missing {pool} finalState"))
-        };
-
-        Ok(TreeState {
-            network: self.inner.network.name().to_owned(),
-            height: response["height"].as_u64().unwrap_or(height),
-            hash: response["hash"].as_str().unwrap_or_default().to_owned(),
-            time: response["time"].as_u64().unwrap_or_default() as u32,
-            sapling_tree: final_tree_state("sapling")?,
-            orchard_tree: final_tree_state("orchard")?,
-            ironwood_tree: response["ironwood"]["commitments"]["finalState"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
-        })
+        self.inner.get_tree_state(height).await
     }
 
     pub async fn get_block_range(
@@ -208,6 +184,14 @@ impl ChainClient {
     /// the actor's existing sync/reopen loop.
     pub async fn get_mempool_stream(&mut self) -> anyhow::Result<ChainStream<RawTransaction>> {
         let rpc = self.inner.clone();
+        let tip_height: u64 = rpc.call("getblockcount", serde_json::json!([])).await?;
+        let tip_hash: String = rpc
+            .call("getblockhash", serde_json::json!([tip_height]))
+            .await?;
+        let observed_tip = (
+            u32::try_from(tip_height).context("Zebra tip height exceeds Indexer range")?,
+            hex::decode(tip_hash).context("decoding Zebra tip hash")?,
+        );
         let mut indexer = self.inner.indexer.clone();
         let mempool = indexer
             .mempool_change(zebra_indexer_proto::Empty {})
@@ -231,6 +215,7 @@ impl ChainClient {
             tip_changes,
             pending: initial.into(),
             known,
+            observed_tip,
         };
         let stream = stream::unfold(state, |mut state| async move {
             loop {
@@ -252,7 +237,10 @@ impl ChainClient {
 
                 tokio::select! {
                     tip = state.tip_changes.message() => match tip {
-                        Ok(Some(_)) => return None,
+                        Ok(Some(tip))
+                            if tip.height != state.observed_tip.0
+                                || tip.hash.as_slice() != state.observed_tip.1.as_slice() => return None,
+                        Ok(Some(_)) => continue,
                         Ok(None) => return Some((Err(anyhow!("Zebra chain-tip stream closed")), state)),
                         Err(error) => return Some((Err(error.into()), state)),
                     },
@@ -328,6 +316,7 @@ struct ZebraMempoolState {
     tip_changes: tonic::codec::Streaming<zebra_indexer_proto::BlockHashAndHeight>,
     pending: std::collections::VecDeque<String>,
     known: std::collections::HashSet<String>,
+    observed_tip: (u32, Vec<u8>),
 }
 
 #[cfg(feature = "zebra-indexer")]
@@ -421,6 +410,33 @@ impl ZebraRpcClient {
             .with_context(|| format!("decoding Zebra RPC {method} result"))
     }
 
+    async fn get_tree_state(&self, height: u64) -> anyhow::Result<TreeState> {
+        let response: serde_json::Value = self
+            .call("z_gettreestate", serde_json::json!([height.to_string()]))
+            .await
+            .context("z_gettreestate failed")?;
+
+        let final_tree_state = |pool: &str| -> anyhow::Result<String> {
+            response[pool]["commitments"]["finalState"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("z_gettreestate response missing {pool} finalState"))
+        };
+
+        Ok(TreeState {
+            network: self.network.name().to_owned(),
+            height: response["height"].as_u64().unwrap_or(height),
+            hash: response["hash"].as_str().unwrap_or_default().to_owned(),
+            time: response["time"].as_u64().unwrap_or_default() as u32,
+            sapling_tree: final_tree_state("sapling")?,
+            orchard_tree: final_tree_state("orchard")?,
+            ironwood_tree: response["ironwood"]["commitments"]["finalState"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        })
+    }
+
     async fn get_compact_block(
         &self,
         height: u64,
@@ -428,7 +444,7 @@ impl ZebraRpcClient {
     ) -> anyhow::Result<CompactBlock> {
         use std::io::Cursor;
         use zcash_client_backend::proto::compact_formats::{
-            CompactOrchardAction, CompactSaplingSpend, CompactTx,
+            ChainMetadata, CompactOrchardAction, CompactSaplingSpend, CompactTx,
         };
 
         let encoded: String = self
@@ -484,6 +500,28 @@ impl ZebraRpcClient {
             compact_txs.push(compact_tx);
         }
 
+        // The compact wallet scanner needs the note commitment tree sizes at
+        // the end of each block. Zebra's raw block RPC omits them, so obtain
+        // them from the same node's tree-state RPC.
+        let tree_state = self.get_tree_state(height).await?;
+        let chain_metadata = ChainMetadata {
+            sapling_commitment_tree_size: tree_state
+                .sapling_tree()?
+                .size()
+                .try_into()
+                .context("Sapling tree size exceeds compact block limit")?,
+            orchard_commitment_tree_size: tree_state
+                .orchard_tree()?
+                .size()
+                .try_into()
+                .context("Orchard tree size exceeds compact block limit")?,
+            ironwood_commitment_tree_size: tree_state
+                .ironwood_tree()?
+                .size()
+                .try_into()
+                .context("Ironwood tree size exceeds compact block limit")?,
+        };
+
         Ok(CompactBlock {
             height,
             hash: header.hash().0.to_vec(),
@@ -491,7 +529,7 @@ impl ZebraRpcClient {
             time: header.time,
             header: vec![],
             vtx: compact_txs,
-            chain_metadata: None,
+            chain_metadata: Some(chain_metadata),
         })
     }
 }

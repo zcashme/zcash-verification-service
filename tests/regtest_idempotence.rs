@@ -37,8 +37,6 @@ const FUND_ZATOSHIS: u64 = 100_000_000;
 const AUTH_PAYMENT_ZATOSHIS: u64 = 200_000;
 const SESSION_ID: &str = "1234567890123456";
 const TIMEOUT: Duration = Duration::from_secs(300);
-// NU6.3 (ironwood) activation height on the regtest chain.
-const NU6_3_ACTIVATION_HEIGHT: u32 = 8;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -333,8 +331,8 @@ impl Drop for Indexer {
 // Zallet is a long-running wallet daemon with a JSON-RPC interface. The funder
 // spawns it as a background process and drives it via HTTP JSON-RPC calls.
 
-/// Branch IDs (hex u32) for the regtest nuparams config.
-///   NU6   = c8e71055    NU6.1 = 4dec4df0    NU6.2 = 5437f330    NU6.3 = 37a5165b
+/// Branch IDs (hex u32) configured for this regtest fixture.
+///   NU6   = c8e71055    NU6.1 = 4dec4df0    NU6.2 = 5437f330
 fn zallet_config(
     zebrad_rpc_port: u16,
     zallet_rpc_port: u16,
@@ -342,7 +340,7 @@ fn zallet_config(
     zebra_state_path: &str,
 ) -> String {
     format!(
-        r#"backend = "zaino"
+        r#"backend = "zebra"
 
 [builder]
 [builder.limits]
@@ -708,9 +706,9 @@ impl ZfaWorker {
     async fn start_on_datadir(
         bin: &Path,
         existing_datadir: Option<&Path>,
-        lwd_grpc_port: u16,
-        zebra_rpc_port: u16,
-        zebra_indexer_port: u16,
+        _lwd_grpc_port: u16,
+        _zebra_rpc_port: u16,
+        _zebra_indexer_port: u16,
     ) -> Result<ZfaWorker> {
         let datadir_path = match existing_datadir {
             Some(p) => p.to_path_buf(),
@@ -732,13 +730,13 @@ impl ZfaWorker {
             "regtest",
         ]);
         #[cfg(feature = "lwd")]
-        command.args(["--lwd-url", &format!("http://127.0.0.1:{lwd_grpc_port}")]);
+        command.args(["--lwd-url", &format!("http://127.0.0.1:{_lwd_grpc_port}")]);
         #[cfg(feature = "zebra-indexer")]
         command.args([
             "--zebra-url",
-            &format!("http://127.0.0.1:{zebra_rpc_port}"),
+            &format!("http://127.0.0.1:{_zebra_rpc_port}"),
             "--zebra-indexer-url",
-            &format!("http://127.0.0.1:{zebra_indexer_port}"),
+            &format!("http://127.0.0.1:{_zebra_indexer_port}"),
         ]);
         let mut child = command
             .env("RUST_LOG", "zfa_backend=info")
