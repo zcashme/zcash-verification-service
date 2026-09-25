@@ -18,14 +18,15 @@ key so both compute the same code without communicating.
 ```
 Consumer app server             response ledger        ZFA worker
 ───────────────────             ───────────────        ──────────
-creates app session                                     connects to lightwalletd/Zaino
-renders ZIP-321 QR              incoming txid ──→       watches GetMempoolStream
+creates app session                                     connects to LWD or local Zebra
+renders ZIP-321 QR              incoming txid ──→       watches chain mempool events
 verifies OTP locally            response txid          decrypts + sends OTP response
 ```
 
-1. Connect to a lightwalletd (or Zaino) gRPC endpoint.
+1. Connect to lightwalletd/Zaino gRPC, or local Zebra JSON-RPC plus Indexer gRPC.
 2. Sync confirmed blocks to recover wallet state.
-3. Stream `GetMempoolStream` for real-time auth payment detection.
+3. Stream mempool notifications for real-time auth payment detection (`GetMempoolStream`
+   from LWD, or Zebra Indexer events resolved through JSON-RPC).
 4. Trial-decrypt incoming transactions with the wallet UFVK.
 5. Validate the ZFA memo format: `DO NOT MODIFY:{zvs/session_id,return-address}`.
 6. Derive `OTP = HMAC-SHA256(otp_key, session_id ‖ return_address)[0..4] mod 10^6`.
@@ -38,7 +39,9 @@ verifies OTP locally            response txid          decrypts + sends OTP resp
 - **Zcash:** librustzcash crates pinned to the ironwood/NU6.3 line (same as `zecd`):
   `zcash_client_backend 0.24.0-rc.6`, `zcash_client_sqlite 0.22.0-rc.6`,
   `zcash_keys 0.16`, `zcash_primitives 0.30`, `orchard 0.15`.
-- **gRPC:** `tonic` (TLS via native roots) talking to lightwalletd/Zaino.
+- **Chain access:** `tonic` gRPC to lightwalletd/Zaino, or local Zebra JSON-RPC
+  plus Zebra Indexer gRPC for push notifications. The Indexer mempool stream
+  reports transaction IDs; JSON-RPC fetches the raw transaction.
 - **Storage:** SQLite — `data.sqlite` (wallet DB, owned by `zcash_client_sqlite`),
   `responses.sqlite` (worker-local response ledger), plus a compact-block cache.
 - **Key custody:** `age` encryption for the on-disk seed, `secrecy` for in-memory
@@ -59,7 +62,6 @@ src/
   sync.rs            block sync + reorg recovery (scan_cached_blocks)
   response_ledger.rs durable idempotence state machine for OTP responses
   backoff.rs         exponential backoff with full jitter for reconnects
-  error.rs           ZfaError type + ProposalError alias
   wallet/
     actor.rs         single-writer actor: sync loop + mempool watcher + OTP sender
     keys.rs          in-memory seed custody (SeedKeeper, OtpSecret), age identity
@@ -83,6 +85,9 @@ encrypted seed. CLI flags override a few values.
 | `--datadir` | `./zfa-data` | Data directory |
 | `--network` | `main` | `main`, `test`, or `regtest` |
 | `--lwd-url` | `https://zec.rocks:443` | lightwalletd/Zaino gRPC endpoint |
+| `--zebra-url` | `http://127.0.0.1:8232` | Local Zebra JSON-RPC endpoint (`zebra-indexer` build) |
+| `--zebra-indexer-url` | `http://127.0.0.1:8230` | Local Zebra Indexer gRPC endpoint (`zebra-indexer` build) |
+| `--zebra-cookie-file` | — | Zebra RPC cookie file when cookie authentication is enabled |
 | `--mnemonic` | — | Restore from mnemonic (requires `--birthday`) |
 | `--birthday` | chain tip | Earliest block that may contain funds |
 | `--keys-file` | same as `--conf` | `[seed]` table from external file (k8s Secret) |

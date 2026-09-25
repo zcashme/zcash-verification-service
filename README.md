@@ -9,9 +9,12 @@ OTP locally.
 
 ## What it does
 
-1. Connects to a lightwalletd (or Zaino) gRPC endpoint.
+1. Connects to lightwalletd (or Zaino) over gRPC, or to a local Zebra node over
+   JSON-RPC with its Indexer gRPC endpoint for mempool and tip notifications.
 2. Syncs confirmed blocks to recover wallet state.
-3. Streams `GetMempoolStream` for real-time auth payment detection.
+3. Streams mempool notifications for real-time auth payment detection. LWD uses
+   `GetMempoolStream`; Zebra's Indexer stream reports transaction IDs, which the
+   worker resolves through Zebra JSON-RPC.
 4. Trial-decrypts incoming transactions with the wallet UFVK.
 5. Validates the ZFA memo format (`DO NOT MODIFY:{zvs/session_id,return-address}`).
 6. Derives `OTP = HMAC-SHA256(otp_key, session_id ‖ return_address)[0..4] mod 10^6`.
@@ -42,6 +45,9 @@ Restore from an existing mnemonic:
 | `--datadir` | `./zfa-data` | Data directory |
 | `--network` | `main` | `main`, `test`, or `regtest` |
 | `--lwd-url` | `https://zec.rocks:443` | lightwalletd/Zaino gRPC endpoint |
+| `--zebra-url` | `http://127.0.0.1:8232` | Zebra JSON-RPC endpoint (`zebra-indexer` build) |
+| `--zebra-indexer-url` | `http://127.0.0.1:8230` | Zebra Indexer gRPC endpoint (`zebra-indexer` build) |
+| `--zebra-cookie-file` | — | Zebra RPC cookie file when cookie authentication is enabled |
 | `--mnemonic` | — | Restore from mnemonic (requires `--birthday`) |
 | `--birthday` | chain tip | Earliest block that may contain funds |
 | `--keys-file` | same as `--conf` | `[seed]` table from external file (k8s Secret) |
@@ -50,6 +56,16 @@ Restore from an existing mnemonic:
 |-----|---------|
 | `RUST_LOG` | Log level (default: `info`) |
 | `ZFA_REGTEST_NU63_HEIGHT` | NU6.3 activation height for regtest |
+
+Build with `cargo build --release --no-default-features --features zebra-indexer`
+to use the local Zebra backend. Zebra must have its JSON-RPC server and Indexer
+gRPC server enabled and bound to local ports. The Indexer stream provides
+notifications; JSON-RPC provides block data, tree state, raw mempool transactions,
+and transaction submission. Set `--zebra-url` and `--zebra-indexer-url` when your
+node uses different ports.
+For Zebra's default cookie authentication, pass its `.cookie` path with
+`--zebra-cookie-file`; the service rereads it for each RPC request so it follows
+cookie rotation when Zebra restarts.
 
 ## Keys
 

@@ -62,6 +62,8 @@ pub struct ActorConfig {
     /// Path to the age identity file that decrypts the mnemonic.
     pub identity_path: PathBuf,
     pub chain_url: String,
+    pub chain_indexer_url: String,
+    pub cookie_file: Option<PathBuf>,
     pub sync_interval: Duration,
     pub connect_timeout: Duration,
     pub reconnect_base: Duration,
@@ -112,6 +114,8 @@ pub async fn build(cfg: ActorConfig) -> anyhow::Result<WalletActor> {
         account_id,
         prover,
         chain_url: cfg.chain_url,
+        chain_indexer_url: cfg.chain_indexer_url,
+        cookie_file: cfg.cookie_file,
         client: None,
         tip_height: None,
         backoff: Backoff::new(cfg.reconnect_base, cfg.reconnect_max),
@@ -150,7 +154,12 @@ async fn ensure_account(
 
     let mut client = tokio::time::timeout(
         Duration::from_secs(30),
-        crate::chain::ChainClient::connect(&cfg.chain_url, cfg.network),
+        crate::chain::ChainClient::connect(
+            &cfg.chain_url,
+            &cfg.chain_indexer_url,
+            cfg.cookie_file.as_deref(),
+            cfg.network,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("timed out connecting for bootstrap"))??;
@@ -185,6 +194,8 @@ pub struct WalletActor {
     account_id: zcash_client_sqlite::AccountUuid,
     prover: LocalTxProver,
     chain_url: String,
+    chain_indexer_url: String,
+    cookie_file: Option<PathBuf>,
     client: Option<crate::chain::ChainClient>,
     tip_height: Option<u32>,
     backoff: Backoff,
@@ -364,7 +375,12 @@ impl WalletActor {
         );
         let client = tokio::time::timeout(
             self.connect_timeout,
-            crate::chain::ChainClient::connect(&self.chain_url, self.network),
+            crate::chain::ChainClient::connect(
+                &self.chain_url,
+                &self.chain_indexer_url,
+                self.cookie_file.as_deref(),
+                self.network,
+            ),
         )
         .await
         .map_err(|_| anyhow::anyhow!("connect timed out after {:?}", self.connect_timeout))??;

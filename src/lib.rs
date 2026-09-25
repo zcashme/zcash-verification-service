@@ -41,15 +41,14 @@ compile_error!("enable exactly one chain source feature: `lwd` or `zebra-indexer
 compile_error!("enable exactly one chain source feature: `lwd` or `zebra-indexer`");
 
 pub mod backoff;
+pub mod chain;
 pub mod config;
 pub mod memo;
 pub mod network;
 pub mod otp;
 pub mod response_ledger;
 pub mod sync;
-pub mod wallet;
-pub mod chain; // framework kept, not active until adapter ready
-
+pub mod wallet; // framework kept, not active until adapter ready
 
 use tracing::info;
 
@@ -122,7 +121,13 @@ pub async fn init_wallet(
     // A fresh wallet has no prior funds, so its birthday is the current tip.
     // A restored wallet must receive an explicit, conservative birthday so it
     // never silently skips pre-existing auth payments or funds.
-    let mut bootstrap_client = crate::chain::ChainClient::connect(config.chain_url()).await?;
+    let mut bootstrap_client = crate::chain::ChainClient::connect(
+        config.chain_url(),
+        config.chain_indexer_url(),
+        config.chain_cookie_file(),
+        config.network,
+    )
+    .await?;
     let birthday_height = match args.birthday {
         Some(0) => anyhow::bail!("wallet birthday must be at least height 1"),
         Some(height) => zcash_protocol::consensus::BlockHeight::from_u32(height),
@@ -272,6 +277,8 @@ pub async fn run(config: config::AppConfig, init_args: config::InitArgs) -> anyh
         seed_path: config.seed_path.clone(),
         identity_path: config.identity_path.clone(),
         chain_url: config.chain_url().to_string(),
+        chain_indexer_url: config.chain_indexer_url().to_string(),
+        cookie_file: config.chain_cookie_file().map(std::path::Path::to_path_buf),
         sync_interval: config.sync_interval(),
         connect_timeout: config.connect_timeout(),
         reconnect_base: config.reconnect_base(),

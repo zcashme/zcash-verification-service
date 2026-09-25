@@ -4356,6 +4356,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zebra-indexer-proto"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54778f59bae3641a85595d5df5e64386f2b59912a6bb79d8de7a024a14166c3d"
+dependencies = [
+ "prost",
+ "serde",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4458,6 +4470,7 @@ dependencies = [
  "anyhow",
  "bip0039",
  "clap",
+ "futures-util",
  "hex",
  "hmac 0.12.1",
  "orchard",
@@ -4484,6 +4497,7 @@ dependencies = [
  "zcash_primitives",
  "zcash_proofs",
  "zcash_protocol",
+ "zebra-indexer-proto",
  "zip32",
  "zip321",
 ]

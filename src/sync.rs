@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use anyhow::anyhow;
+use futures_util::StreamExt;
 use prost::Message;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -179,7 +180,8 @@ async fn download_blocks(
     let mut stream = client.get_block_range(start as u64, end as u64).await?;
     let mut block_meta = vec![];
 
-    while let Some(block) = stream.message().await? {
+    while let Some(block) = stream.next().await {
+        let block = block?;
         let (sapling_outputs_count, orchard_actions_count) = block
             .vtx
             .iter()

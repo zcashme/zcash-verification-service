@@ -47,11 +47,14 @@ bip0039 = { version = "0.12", features = ["std", "all-languages"] }
 age = { version = "0.11", features = ["armor"] }
 zip32 = "0.2"
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json"] }
+serde_json = { version = "1", optional = true }
+zebra-indexer-proto = { version = "2.5.0", optional = true }
 
 
 hex = "0.4"
 subtle = "2"
 prost = "0.14"
+futures-util = "0.3"
 zip321 = "0.9.0-rc.1"
 sapling = { package = "sapling-crypto", version = "0.7" }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
@@ -59,7 +62,7 @@ rand = { version = "0.8", default-features = false, features = ["std", "std_rng"
 [features]
 default = ["lwd"]
 lwd = []
-zebra-indexer = ["dep:reqwest"]
+zebra-indexer = ["dep:reqwest", "dep:serde_json", "dep:zebra-indexer-proto"]
 
 [dev-dependencies]
 tempfile = "3"
