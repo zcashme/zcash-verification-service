@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use anyhow::anyhow;
+use futures_util::StreamExt;
 use prost::Message;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -23,7 +24,6 @@ use zcash_client_sqlite::chain::BlockMeta;
 use zcash_client_sqlite::{error::SqliteClientError, FsBlockDb};
 use zcash_protocol::consensus::BlockHeight;
 
-use crate::lwd::LwdClient;
 use crate::network::ZNetwork;
 use crate::wallet::open::{block_path, WriteDb};
 
@@ -35,7 +35,7 @@ const BATCH_SIZE: u32 = 10_000;
 /// `false` if the wallet is caught up (no pending scan ranges).
 pub async fn sync_one_batch(
     name: &str,
-    client: &mut LwdClient,
+    client: &mut crate::chain::ChainClient,
     params: ZNetwork,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
@@ -163,7 +163,7 @@ fn rewind_wallet(
 
 /// Download compact blocks for a scan range and write them to the block cache.
 async fn download_blocks(
-    client: &mut LwdClient,
+    client: &mut crate::chain::ChainClient,
     wallet_dir: &Path,
     db_cache: &mut FsBlockDb,
     scan_range: &ScanRange,
@@ -180,7 +180,8 @@ async fn download_blocks(
     let mut stream = client.get_block_range(start as u64, end as u64).await?;
     let mut block_meta = vec![];
 
-    while let Some(block) = stream.message().await? {
+    while let Some(block) = stream.next().await {
+        let block = block?;
         let (sapling_outputs_count, orchard_actions_count) = block
             .vtx
             .iter()

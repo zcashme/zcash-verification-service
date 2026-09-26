@@ -8,6 +8,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
@@ -30,7 +31,6 @@ use zcash_protocol::value::Zatoshis;
 use zcash_protocol::TxId;
 
 use crate::backoff::Backoff;
-use crate::lwd::LwdClient;
 use crate::memo;
 use crate::network::ZNetwork;
 use crate::otp;
@@ -48,6 +48,10 @@ const MIN_SPLIT_OUTPUT_VALUE: u64 = 500_000; // 0.005 ZEC — covers ~8 OTP resp
 const MIN_AUTH_PAYMENT: u64 = 200_000;
 /// Fixed OTP response amount, retained from the original worker.
 const OTP_RESPONSE_AMOUNT: u64 = 50_000;
+/// If nothing arrives on the mempool stream for this long, assume the
+/// connection is dead and reconnect. Zcash blocks arrive every ~75s and each
+/// one ends the stream, so a healthy stream is never this quiet.
+const MEMPOOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Parameters needed to launch the wallet actor.
 pub struct ActorConfig {
@@ -57,7 +61,9 @@ pub struct ActorConfig {
     pub seed_path: PathBuf,
     /// Path to the age identity file that decrypts the mnemonic.
     pub identity_path: PathBuf,
-    pub lwd_url: String,
+    pub chain_url: String,
+    pub chain_indexer_url: String,
+    pub cookie_file: Option<PathBuf>,
     pub sync_interval: Duration,
     pub connect_timeout: Duration,
     pub reconnect_base: Duration,
@@ -107,7 +113,9 @@ pub async fn build(cfg: ActorConfig) -> anyhow::Result<WalletActor> {
         seed,
         account_id,
         prover,
-        lwd_url: cfg.lwd_url,
+        chain_url: cfg.chain_url,
+        chain_indexer_url: cfg.chain_indexer_url,
+        cookie_file: cfg.cookie_file,
         client: None,
         tip_height: None,
         backoff: Backoff::new(cfg.reconnect_base, cfg.reconnect_max),
@@ -144,10 +152,17 @@ async fn ensure_account(
     // height. We must do the same — not subtract 1.
     let prior = u32::from(store.birthday);
 
-    let mut client =
-        tokio::time::timeout(Duration::from_secs(30), LwdClient::connect(&cfg.lwd_url))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out connecting for bootstrap"))??;
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(30),
+        crate::chain::ChainClient::connect(
+            &cfg.chain_url,
+            &cfg.chain_indexer_url,
+            cfg.cookie_file.as_deref(),
+            cfg.network,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out connecting for bootstrap"))??;
 
     let tree_state = tokio::time::timeout(
         Duration::from_secs(30),
@@ -178,8 +193,10 @@ pub struct WalletActor {
     seed: SeedKeeper,
     account_id: zcash_client_sqlite::AccountUuid,
     prover: LocalTxProver,
-    lwd_url: String,
-    client: Option<LwdClient>,
+    chain_url: String,
+    chain_indexer_url: String,
+    cookie_file: Option<PathBuf>,
+    client: Option<crate::chain::ChainClient>,
     tip_height: Option<u32>,
     backoff: Backoff,
     sync_interval: Duration,
@@ -281,15 +298,24 @@ impl WalletActor {
             let Some(client) = self.client.as_mut() else {
                 continue;
             };
-            let stream = match client.get_mempool_stream().await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("[zfa] failed to open mempool stream: {e}");
-                    self.client = None;
-                    tokio::time::sleep(self.sync_interval).await;
-                    continue;
-                }
-            };
+            let stream =
+                match tokio::time::timeout(Duration::from_secs(30), client.get_mempool_stream())
+                    .await
+                {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        warn!("[zfa] failed to open mempool stream: {e}");
+                        self.client = None;
+                        tokio::time::sleep(self.sync_interval).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        warn!("[zfa] timed out opening mempool stream");
+                        self.client = None;
+                        tokio::time::sleep(self.sync_interval).await;
+                        continue;
+                    }
+                };
             info!("[zfa] mempool stream opened");
 
             let mut stream = stream;
@@ -300,21 +326,33 @@ impl WalletActor {
                         info!("[zfa] shutdown during mempool watch");
                         return;
                     }
-                    msg = stream.message() => {
+                    msg = stream.next() => {
                         match msg {
-                            Ok(Some(raw_tx)) => {
+                            Some(Ok(raw_tx)) => {
                                 self.process_mempool_tx(&mut response_ledger, raw_tx).await;
                             }
-                            Ok(None) => {
+                            None => {
                                 info!("[zfa] mempool stream closed (new block)");
                                 break;
                             }
-                            Err(e) => {
+                            Some(Err(e)) => {
                                 warn!("[zfa] mempool stream error: {e}");
                                 self.client = None;
                                 break;
                             }
                         }
+                    }
+                    // Belt-and-suspenders watchdog: keepalive pings normally
+                    // surface a dead connection as a stream error, but if
+                    // anything slips through (e.g. a server-side hang) we
+                    // detect total silence here instead of parking forever.
+                    _ = tokio::time::sleep(MEMPOOL_IDLE_TIMEOUT) => {
+                        warn!(
+                            "[zfa] mempool stream idle for {:?}; assuming dead, reconnecting",
+                            MEMPOOL_IDLE_TIMEOUT
+                        );
+                        self.client = None;
+                        break;
                     }
                 }
             }
@@ -330,10 +368,22 @@ impl WalletActor {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        info!("[zfa] connecting to lightwalletd: {}", self.lwd_url);
-        let client = tokio::time::timeout(self.connect_timeout, LwdClient::connect(&self.lwd_url))
-            .await
-            .map_err(|_| anyhow::anyhow!("connect timed out after {:?}", self.connect_timeout))??;
+        info!(
+            "[zfa] connecting to {}: {}",
+            crate::config::CHAIN_SOURCE,
+            self.chain_url
+        );
+        let client = tokio::time::timeout(
+            self.connect_timeout,
+            crate::chain::ChainClient::connect(
+                &self.chain_url,
+                &self.chain_indexer_url,
+                self.cookie_file.as_deref(),
+                self.network,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timed out after {:?}", self.connect_timeout))??;
         self.client = Some(client);
         self.backoff.reset();
         Ok(())
@@ -344,7 +394,9 @@ impl WalletActor {
             .client
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("not connected"))?;
-        let tip = client.get_latest_block().await?;
+        let tip = tokio::time::timeout(Duration::from_secs(30), client.get_latest_block())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out fetching chain tip"))??;
         let height = u32::try_from(tip.height)
             .map_err(|_| anyhow::anyhow!("lightwalletd returned an out-of-range chain height"))?;
         if self.tip_height != Some(height) {
@@ -512,7 +564,7 @@ impl WalletActor {
         let account_id = self.account_id;
         let zaddr = parse_return_address(self.network, recipient_address)?;
 
-        let memo_str = format!("(ZFA OTP){otp_code}");
+        let memo_str = otp_code;
         let mut memo_bytes = [0u8; 512];
         memo_bytes[..memo_str.len()].copy_from_slice(memo_str.as_bytes());
         let memo = zcash_protocol::memo::MemoBytes::from_bytes(&memo_bytes)
@@ -657,14 +709,16 @@ impl WalletActor {
 
         Ok(())
     }
-
 }
 
 /// Parse an exact return-address string and require a shielded receiver on
 /// this worker's network. `ZcashAddress::convert_if_network` is the
 /// upstream network validation boundary; `Payment::new` then enforces that
 /// the selected recipient can carry a memo.
-fn parse_return_address(network: ZNetwork, encoded: &str) -> anyhow::Result<zcash_address::ZcashAddress> {
+fn parse_return_address(
+    network: ZNetwork,
+    encoded: &str,
+) -> anyhow::Result<zcash_address::ZcashAddress> {
     let address = zcash_address::ZcashAddress::try_from_encoded(encoded)
         .map_err(|e| anyhow::anyhow!("invalid return address: {e}"))?;
     if !address.can_receive_memo() {
