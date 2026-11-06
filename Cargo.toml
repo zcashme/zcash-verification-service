@@ -29,7 +29,7 @@ zcash_address = "0.14"
 zcash_client_backend = { version = "0.25", features = ["orchard", "transparent-inputs", "lightwalletd-tonic-transport"] }
 zcash_client_sqlite = { version = "0.23", features = ["unstable", "orchard", "transparent-inputs"] }
 zcash_keys = { version = "0.17", features = ["unstable", "orchard"] }
-zcash_primitives = "0.31"
+zcash_primitives = { version = "0.31", features = ["non-standard-fees"] }
 zcash_proofs = { version = "0.31", features = ["bundled-prover"] }
 zcash_protocol = { version = "0.11", features = ["local-consensus"] }
 orchard = { version = "0.16", default-features = false, features = ["circuit"] }
