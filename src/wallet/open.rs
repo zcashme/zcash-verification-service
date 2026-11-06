@@ -7,7 +7,6 @@
 
 use std::path::{Path, PathBuf};
 
-use rand::rngs::OsRng;
 
 use zcash_client_sqlite::chain::init::init_blockmeta_db;
 use zcash_client_sqlite::chain::BlockMeta;
@@ -21,7 +20,10 @@ const DATA_DB: &str = "data.sqlite";
 const BLOCKS_FOLDER: &str = "blocks";
 
 /// A read/write wallet handle (uses a real clock + OS RNG, required for writes).
-pub type WriteDb = WalletDb<rusqlite::Connection, ZNetwork, SystemClock, OsRng>;
+/// OS-backed CSPRNG for wallet writes (rand_core 0.10, as the librustzcash crates require).
+pub type WalletRng = rand_core::UnwrapErr<getrandom::SysRng>;
+
+pub type WriteDb = WalletDb<rusqlite::Connection, ZNetwork, SystemClock, WalletRng>;
 
 pub fn data_db_path(wallet_dir: &Path) -> PathBuf {
     wallet_dir.join(DATA_DB)
@@ -37,7 +39,7 @@ pub fn open_write(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<WriteD
     let conn = rusqlite::Connection::open(&path)?;
     restrict_wallet_db_permissions(&path)?;
     configure_writer_conn(&conn)?;
-    Ok(WalletDb::from_connection(conn, network, SystemClock, OsRng))
+    Ok(WalletDb::from_connection(conn, network, SystemClock, rand_core::UnwrapErr(getrandom::SysRng)))
 }
 
 /// `data.sqlite` contains the service viewing key and decrypted transaction

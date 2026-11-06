@@ -808,6 +808,8 @@ fn do_send_otp_response(
     let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions(
         db,
         net,
+        &zcash_client_sqlite::util::SystemClock,
+        &mut rand_core::UnwrapErr(getrandom::SysRng),
         prover,
         prover,
         &SpendingKeys::from_unified_spending_key(usk.clone()),
