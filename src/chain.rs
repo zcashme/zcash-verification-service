@@ -481,7 +481,7 @@ impl ZebraRpcClient {
                         nullifier: action.nullifier().to_bytes().to_vec(),
                         cmx: action.cmx().to_bytes().to_vec(),
                         ephemeral_key: action.encrypted_note().epk_bytes.to_vec(),
-                        ciphertext: action.encrypted_note().enc_ciphertext[..52].to_vec(),
+                        ciphertext: action.encrypted_note().enc_ciphertext.as_ref()[..52].to_vec(),
                     })
                     .collect();
             }
@@ -493,7 +493,7 @@ impl ZebraRpcClient {
                         nullifier: action.nullifier().to_bytes().to_vec(),
                         cmx: action.cmx().to_bytes().to_vec(),
                         ephemeral_key: action.encrypted_note().epk_bytes.to_vec(),
-                        ciphertext: action.encrypted_note().enc_ciphertext[..52].to_vec(),
+                        ciphertext: action.encrypted_note().enc_ciphertext.as_ref()[..52].to_vec(),
                     })
                     .collect();
             }

@@ -107,7 +107,9 @@ pub async fn init_wallet(
         UnifiedSpendingKey::from_seed(&config.network, seed_bytes.expose_secret(), account_index)
             .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
     let ufvk = usk.to_unified_full_viewing_key();
-    let ufvk_encoded = ufvk.encode(&config.network);
+    let ufvk_encoded = ufvk
+        .encode(&config.network)
+        .context("encoding the service UFVK")?;
     let (service_address, _) = ufvk
         .default_address(UnifiedAddressRequest::AllAvailableKeys)
         .map_err(|e| anyhow::anyhow!("deriving service unified address: {e}"))?;
@@ -170,7 +172,7 @@ pub async fn init_wallet(
         .get_account(account_id)
         .map_err(|e| anyhow::anyhow!("get_account: {e}"))?
         .and_then(|a: zcash_client_sqlite::wallet::Account| {
-            a.ufvk().map(|u| u.encode(&config.network))
+            a.ufvk().and_then(|u| u.encode(&config.network).ok())
         });
     if created_ufvk.as_deref() != Some(ufvk_encoded.as_str()) {
         anyhow::bail!("internal error: created account UFVK does not match the seed-derived UFVK");

@@ -18,7 +18,7 @@ use zcash_client_backend::data_api::wallet::{
 };
 use zcash_client_backend::data_api::{WalletRead as _, WalletWrite as _};
 use zcash_client_backend::fees::{
-    standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
+    zip317::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy,
 };
 use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_backend::{decrypt_transaction, DecryptedOutput, TransferType};
@@ -44,6 +44,10 @@ use crate::wallet::store::WalletStore;
 /// Note-management defaults (from zecd).
 const TARGET_NOTE_COUNT: usize = 3;
 const MIN_SPLIT_OUTPUT_VALUE: u64 = 500_000; // 0.005 ZEC — covers ~8 OTP responses per note
+/// ZIP 317 marginal fee per logical action, in zatoshis. Hardcoded (the library default is 5,000).
+/// The fee for a transaction is this times max(2, logical actions): 2,000 zats for the usual
+/// one-spend, one-payment, one-change response.
+const MARGINAL_FEE_ZATS: u64 = 1_000;
 /// An incoming note must pay at least 0.002 ZEC to request an OTP response.
 const MIN_AUTH_PAYMENT: u64 = 200_000;
 /// Fixed OTP response amount, retained from the original worker.
@@ -760,6 +764,21 @@ fn collect_incoming_from_pool<Note>(
         });
     }
 }
+/// The ZIP 317 fee rule for OTP responses: standard shape, hardcoded marginal fee.
+fn otp_fee_rule() -> anyhow::Result<zcash_primitives::transaction::fees::zip317::FeeRule> {
+    use zcash_primitives::transaction::fees::zip317::{
+        FeeRule, GRACE_ACTIONS, P2PKH_STANDARD_INPUT_SIZE, P2PKH_STANDARD_OUTPUT_SIZE,
+    };
+    FeeRule::non_standard(
+        Zatoshis::from_u64(MARGINAL_FEE_ZATS)
+            .map_err(|e| anyhow::anyhow!("invalid marginal fee: {e}"))?,
+        GRACE_ACTIONS,
+        P2PKH_STANDARD_INPUT_SIZE,
+        P2PKH_STANDARD_OUTPUT_SIZE,
+    )
+    .ok_or_else(|| anyhow::anyhow!("could not construct the ZIP 317 fee rule"))
+}
+
 fn do_send_otp_response(
     db: &mut WriteDb,
     net: &ZNetwork,
@@ -772,8 +791,9 @@ fn do_send_otp_response(
         .ok_or_else(|| anyhow::anyhow!("target note count must be nonzero"))?;
     let min_split_output = Zatoshis::from_u64(MIN_SPLIT_OUTPUT_VALUE)
         .map_err(|e| anyhow::anyhow!("invalid minimum split-output value: {e}"))?;
+    let fee_rule = otp_fee_rule()?;
     let change_strategy = MultiOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
+        fee_rule,
         None,
         zcash_protocol::ShieldedPool::Ironwood,
         DustOutputPolicy::default(),
@@ -808,6 +828,8 @@ fn do_send_otp_response(
     let txids = zcash_client_backend::data_api::wallet::create_proposed_transactions(
         db,
         net,
+        &zcash_client_sqlite::util::SystemClock,
+        &mut rand_core::UnwrapErr(getrandom::SysRng),
         prover,
         prover,
         &SpendingKeys::from_unified_spending_key(usk.clone()),
@@ -827,4 +849,17 @@ fn do_send_otp_response(
     )?;
 
     Ok(txids.into())
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::*;
+
+    #[test]
+    fn otp_fee_rule_uses_the_hardcoded_marginal_fee() {
+        let rule = otp_fee_rule().expect("rule");
+        assert_eq!(rule.marginal_fee().into_u64(), 1_000);
+        assert_eq!(MARGINAL_FEE_ZATS, 1_000);
+        assert_eq!(rule.grace_actions(), 2);
+    }
 }

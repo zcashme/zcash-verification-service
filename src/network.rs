@@ -105,10 +105,7 @@ pub fn regtest() -> ZNetwork {
         nu6_1: nu62,
         nu6_2: nu62,
         nu6_3: nu63,
-        #[cfg(zcash_unstable = "nu7")]
         nu7: nu62,
-        #[cfg(zcash_unstable = "zfuture")]
-        z_future: nu62,
     })
 }
 

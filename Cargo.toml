@@ -2,7 +2,7 @@
 name = "zfa-backend"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "ZFA authentication worker — watches the Zcash mempool for shielded login payments"
 
 [[bin]]
@@ -24,15 +24,15 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
-# Zcash — pinned to the ironwood/NU6.3 librustzcash line (same as zecd)
-zcash_address = "0.13"
-zcash_client_backend = { version = "0.24.0-rc.6", features = ["orchard", "transparent-inputs", "lightwalletd-tonic-transport"] }
-zcash_client_sqlite = { version = "0.22.0-rc.6", features = ["unstable", "orchard", "transparent-inputs"] }
-zcash_keys = { version = "0.16", features = ["unstable", "orchard"] }
-zcash_primitives = "0.30"
-zcash_proofs = { version = "0.30", features = ["bundled-prover"] }
-zcash_protocol = { version = "0.10", features = ["local-consensus"] }
-orchard = { version = "0.15", default-features = false, features = ["circuit"] }
+# Zcash — NU7-capable librustzcash line (matches zns-mempool)
+zcash_address = "0.14"
+zcash_client_backend = { version = "0.25", features = ["orchard", "transparent-inputs", "lightwalletd-tonic-transport"] }
+zcash_client_sqlite = { version = "0.23", features = ["unstable", "orchard", "transparent-inputs"] }
+zcash_keys = { version = "0.17", features = ["unstable", "orchard"] }
+zcash_primitives = { version = "0.31", features = ["non-standard-fees"] }
+zcash_proofs = { version = "0.31", features = ["bundled-prover"] }
+zcash_protocol = { version = "0.11", features = ["local-consensus"] }
+orchard = { version = "0.16", default-features = false, features = ["circuit"] }
 
 # Response ledger (separate from the wallet DB; consumer app sessions are external)
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -45,7 +45,7 @@ sha2 = "0.10"
 secrecy = "0.8"
 bip0039 = { version = "0.12", features = ["std", "all-languages"] }
 age = { version = "0.11", features = ["armor"] }
-zip32 = "0.2"
+zip32 = "0.3"
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json"] }
 serde_json = { version = "1", optional = true }
 zebra-indexer-proto = { version = "2.5.0", optional = true }
@@ -55,9 +55,12 @@ hex = "0.4"
 subtle = "2"
 prost = "0.14"
 futures-util = "0.3"
-zip321 = "0.9.0-rc.1"
-sapling = { package = "sapling-crypto", version = "0.7" }
+zip321 = "0.10"
+sapling = { package = "sapling-crypto", version = "0.9" }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+# The librustzcash wallet crates use rand_core 0.10; this is their OS-backed CSPRNG.
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng"] }
 
 [features]
 default = ["lwd"]
