@@ -286,6 +286,7 @@ pub async fn run(config: config::AppConfig, init_args: config::InitArgs) -> anyh
         reconnect_base: config.reconnect_base(),
         reconnect_max: config.reconnect_max(),
         response_ledger_path,
+        otp_response_zats: config.otp_response_zats,
         shutdown: shutdown_tx.subscribe(),
     };
 

@@ -5,8 +5,10 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 
-# Build release binary
-RUN cargo build --release
+# Chain source, selected at compile time: "zebra-indexer" (local Zebra/Zakura node,
+# default) or "lwd" (lightwalletd).
+ARG FEATURES=zebra-indexer
+RUN cargo build --release --no-default-features --features "${FEATURES}"
 
 # Runtime stage — match zvs-runtime:bookworm
 FROM debian:bookworm-slim

@@ -48,6 +48,7 @@ Restore from an existing mnemonic:
 | `--zebra-url` | `http://127.0.0.1:8232` | Zebra JSON-RPC endpoint (`zebra-indexer` build) |
 | `--zebra-indexer-url` | `http://127.0.0.1:8230` | Zebra Indexer gRPC endpoint (`zebra-indexer` build) |
 | `--zebra-cookie-file` | — | Zebra RPC cookie file when cookie authentication is enabled |
+| `--otp-response-zats` | `10000` | Zatoshis sent with each OTP response (env `ZFA_OTP_RESPONSE_ZATS`); ZFA Maxi runs with `5000` |
 | `--mnemonic` | — | Restore from mnemonic (requires `--birthday`) |
 | `--birthday` | chain tip | Earliest block that may contain funds |
 | `--keys-file` | same as `--conf` | `[seed]` table from external file (k8s Secret) |
@@ -58,6 +59,7 @@ Restore from an existing mnemonic:
 | `ZFA_REGTEST_NU63_HEIGHT` | NU6.3 activation height for regtest |
 
 Build with `cargo build --release --no-default-features --features zebra-indexer`
+(the Dockerfile does this by default; `--build-arg FEATURES=lwd` selects lightwalletd)
 to use the local Zebra backend. Zebra must have its JSON-RPC server and Indexer
 gRPC server enabled and bound to local ports. The Indexer stream provides
 notifications; JSON-RPC provides block data, tree state, raw mempool transactions,

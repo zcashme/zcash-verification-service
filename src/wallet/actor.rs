@@ -50,8 +50,6 @@ const MIN_SPLIT_OUTPUT_VALUE: u64 = 500_000; // 0.005 ZEC — covers ~8 OTP resp
 const MARGINAL_FEE_ZATS: u64 = 1_000;
 /// An incoming note must pay at least 0.002 ZEC to request an OTP response.
 const MIN_AUTH_PAYMENT: u64 = 200_000;
-/// Fixed OTP response amount, retained from the original worker.
-const OTP_RESPONSE_AMOUNT: u64 = 50_000;
 /// If nothing arrives on the mempool stream for this long, assume the
 /// connection is dead and reconnect. Zcash blocks arrive every ~75s and each
 /// one ends the stream, so a healthy stream is never this quiet.
@@ -73,6 +71,8 @@ pub struct ActorConfig {
     pub reconnect_base: Duration,
     pub reconnect_max: Duration,
     pub response_ledger_path: PathBuf,
+    /// Amount in zatoshis sent with each OTP response.
+    pub otp_response_zats: u64,
     pub shutdown: watch::Receiver<bool>,
 }
 
@@ -127,6 +127,7 @@ pub async fn build(cfg: ActorConfig) -> anyhow::Result<WalletActor> {
         connect_timeout: cfg.connect_timeout,
         otp_secret: OtpSecret::new(otp_key),
         response_ledger_path: cfg.response_ledger_path,
+        otp_response_zats: cfg.otp_response_zats,
         shutdown: cfg.shutdown,
     })
 }
@@ -207,6 +208,7 @@ pub struct WalletActor {
     connect_timeout: Duration,
     otp_secret: OtpSecret,
     response_ledger_path: PathBuf,
+    otp_response_zats: u64,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -577,7 +579,7 @@ impl WalletActor {
         let payment = zip321::Payment::new(
             zaddr,
             Some(
-                zcash_protocol::value::Zatoshis::from_u64(OTP_RESPONSE_AMOUNT)
+                zcash_protocol::value::Zatoshis::from_u64(self.otp_response_zats)
                     .map_err(|e| anyhow::anyhow!("invalid amount: {e}"))?,
             ),
             Some(memo),

@@ -62,6 +62,9 @@ pub const CHAIN_SOURCE: &str = "zebra-indexer";
 /// Default data directory.
 pub const DEFAULT_DATADIR: &str = "./zfa-data";
 
+/// Default OTP response amount in zatoshis (the standard ZFA; Maxi runs with 5,000).
+pub const DEFAULT_OTP_RESPONSE_ZATS: u64 = 10_000;
+
 // ── Resolved config ─────────────────────────────────────────────────────────
 
 /// The resolved worker configuration. Operational fields are hardcoded;
@@ -91,6 +94,8 @@ pub struct AppConfig {
     pub seed_path: PathBuf,
     /// Path to the age identity file that decrypts the mnemonic.
     pub identity_path: PathBuf,
+    /// Amount, in zatoshis, sent back with each OTP response.
+    pub otp_response_zats: u64,
 }
 
 impl AppConfig {
@@ -226,6 +231,9 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub zebra_cookie_file: Option<PathBuf>,
 
+    /// Amount in zatoshis sent with each OTP response (default 10000; ZFA Maxi uses 5000).
+    #[arg(long, value_name = "ZATS", env = "ZFA_OTP_RESPONSE_ZATS")]
+    pub otp_response_zats: Option<u64>,
     /// Mnemonic phrase to restore from. If omitted, a fresh wallet is generated.
     #[arg(long, value_name = "PHRASE")]
     pub mnemonic: Option<String>,
@@ -360,7 +368,13 @@ impl AppConfig {
         #[cfg(feature = "zebra-indexer")]
         let zebra_cookie_file = cli.zebra_cookie_file.clone();
 
+        let otp_response_zats = cli.otp_response_zats.unwrap_or(DEFAULT_OTP_RESPONSE_ZATS);
+        if otp_response_zats == 0 {
+            anyhow::bail!("--otp-response-zats must be greater than zero");
+        }
+
         Ok(AppConfig {
+            otp_response_zats,
             network,
             datadir,
             #[cfg(feature = "lwd")]
@@ -406,4 +420,31 @@ pub fn init_tracing() {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod otp_response_tests {
+    use super::*;
+
+    fn resolve(args: &[&str]) -> anyhow::Result<AppConfig> {
+        let mut argv = vec!["zfa-backend"];
+        argv.extend_from_slice(args);
+        AppConfig::resolve(&Cli::try_parse_from(argv).expect("valid args"))
+    }
+
+    #[test]
+    fn defaults_to_ten_thousand_zats() {
+        assert_eq!(resolve(&[]).unwrap().otp_response_zats, 10_000);
+    }
+
+    #[test]
+    fn maxi_can_override_to_five_thousand() {
+        let cfg = resolve(&["--otp-response-zats", "5000"]).unwrap();
+        assert_eq!(cfg.otp_response_zats, 5_000);
+    }
+
+    #[test]
+    fn zero_is_rejected() {
+        assert!(resolve(&["--otp-response-zats", "0"]).is_err());
+    }
 }
