@@ -118,6 +118,11 @@ impl ChainClient {
         Ok(box_tonic_stream(stream))
     }
 
+    /// lightwalletd exposes no fee-policy RPC; the compiled-in ZIP 317 rule applies.
+    pub async fn get_standard_fee(&mut self) -> anyhow::Result<Option<crate::fee::StandardFee>> {
+        Ok(None)
+    }
+
     pub async fn send_transaction(&mut self, data: Vec<u8>) -> anyhow::Result<(i32, String)> {
         let response = self
             .inner
@@ -270,6 +275,15 @@ impl ChainClient {
             }
         });
         Ok(Box::pin(stream))
+    }
+
+    /// Ask the node for its recommended fee per logical action (`getstandardfee`).
+    pub async fn get_standard_fee(&mut self) -> anyhow::Result<Option<crate::fee::StandardFee>> {
+        let fee: crate::fee::StandardFee = self
+            .inner
+            .call("getstandardfee", serde_json::json!([]))
+            .await?;
+        Ok(Some(fee))
     }
 
     pub async fn send_transaction(&mut self, data: Vec<u8>) -> anyhow::Result<(i32, String)> {

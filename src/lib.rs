@@ -43,6 +43,7 @@ compile_error!("enable exactly one chain source feature: `lwd` or `zebra-indexer
 pub mod backoff;
 pub mod chain;
 pub mod config;
+pub mod fee;
 pub mod memo;
 pub mod network;
 pub mod otp;
