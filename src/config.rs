@@ -24,9 +24,25 @@ pub const ACCOUNT_INDEX: u32 = 0;
 pub const ACCOUNT_NAME: &str = "primary";
 
 /// Default lightwalletd gRPC endpoint (mainnet) — zec.rocks public instance.
+#[cfg(feature = "lwd")]
 pub const LWD_DEFAULT_URL_MAIN: &str = "https://zec.rocks:443";
 /// Default lightwalletd gRPC endpoint (testnet) — zec.rocks public testnet instance.
+#[cfg(feature = "lwd")]
 pub const LWD_DEFAULT_URL_TEST: &str = "https://testnet.zec.rocks:443";
+
+/// Default local Zebra JSON-RPC endpoint (mainnet).
+#[cfg(feature = "zebra-indexer")]
+pub const ZEBRA_DEFAULT_URL_MAIN: &str = "http://127.0.0.1:8232";
+/// Default local Zebra JSON-RPC endpoint (testnet).
+#[cfg(feature = "zebra-indexer")]
+pub const ZEBRA_DEFAULT_URL_TEST: &str = "http://127.0.0.1:18232";
+
+/// Default local Zebra Indexer gRPC endpoint (mainnet).
+#[cfg(feature = "zebra-indexer")]
+pub const ZEBRA_INDEXER_DEFAULT_URL_MAIN: &str = "http://127.0.0.1:8230";
+/// Default local Zebra Indexer gRPC endpoint (testnet).
+#[cfg(feature = "zebra-indexer")]
+pub const ZEBRA_INDEXER_DEFAULT_URL_TEST: &str = "http://127.0.0.1:18230";
 
 /// Sync poll interval.
 pub const SYNC_INTERVAL_SECS: u64 = 20;
@@ -36,6 +52,12 @@ pub const RECONNECT_BASE_SECS: u64 = 1;
 pub const RECONNECT_MAX_SECS: u64 = 60;
 /// Per-attempt LWD connect timeout.
 pub const CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Chain source selected at compile time (`lwd` default, `zebra-indexer`).
+#[cfg(feature = "lwd")]
+pub const CHAIN_SOURCE: &str = "lwd";
+#[cfg(feature = "zebra-indexer")]
+pub const CHAIN_SOURCE: &str = "zebra-indexer";
 
 /// Default data directory.
 pub const DEFAULT_DATADIR: &str = "./zfa-data";
@@ -50,8 +72,18 @@ pub struct AppConfig {
     pub network: ZNetwork,
     /// Data directory (wallet DB, response ledger, identity.txt, blocks/).
     pub datadir: PathBuf,
-    /// lightwalletd (or Zaino) gRPC endpoint URL.
+    /// lightwalletd gRPC endpoint URL.
+    #[cfg(feature = "lwd")]
     pub lwd_url: String,
+    /// Local Zebra JSON-RPC endpoint URL.
+    #[cfg(feature = "zebra-indexer")]
+    pub zebra_url: String,
+    /// Local Zebra Indexer gRPC endpoint URL for event notifications.
+    #[cfg(feature = "zebra-indexer")]
+    pub zebra_indexer_url: String,
+    /// Optional path to Zebra's JSON-RPC cookie file.
+    #[cfg(feature = "zebra-indexer")]
+    pub zebra_cookie_file: Option<PathBuf>,
     /// Path to the TOML file containing the `[seed]` table.
     pub conf_path: PathBuf,
     /// Path to the file containing the `[seed]` table (escape hatch: may differ
@@ -63,10 +95,65 @@ pub struct AppConfig {
 
 impl AppConfig {
     /// Default LWD URL for a given network.
+    #[cfg(feature = "lwd")]
     pub fn default_lwd_url(network: ZNetwork) -> String {
         match network {
             ZNetwork::Main => LWD_DEFAULT_URL_MAIN.to_string(),
             ZNetwork::Test | ZNetwork::Regtest(_) => LWD_DEFAULT_URL_TEST.to_string(),
+        }
+    }
+
+    /// Default local Zebra indexer URL for a given network.
+    #[cfg(feature = "zebra-indexer")]
+    pub fn default_zebra_url(network: ZNetwork) -> String {
+        match network {
+            ZNetwork::Main => ZEBRA_DEFAULT_URL_MAIN.to_string(),
+            ZNetwork::Test | ZNetwork::Regtest(_) => ZEBRA_DEFAULT_URL_TEST.to_string(),
+        }
+    }
+
+    /// Default local Zebra Indexer URL for a given network.
+    #[cfg(feature = "zebra-indexer")]
+    pub fn default_zebra_indexer_url(network: ZNetwork) -> String {
+        match network {
+            ZNetwork::Main => ZEBRA_INDEXER_DEFAULT_URL_MAIN.to_string(),
+            ZNetwork::Test | ZNetwork::Regtest(_) => ZEBRA_INDEXER_DEFAULT_URL_TEST.to_string(),
+        }
+    }
+
+    /// Endpoint selected by the compile-time chain-source feature.
+    pub fn chain_url(&self) -> &str {
+        #[cfg(feature = "lwd")]
+        {
+            &self.lwd_url
+        }
+        #[cfg(feature = "zebra-indexer")]
+        {
+            &self.zebra_url
+        }
+    }
+
+    /// Indexer event endpoint selected by the compile-time chain-source feature.
+    pub fn chain_indexer_url(&self) -> &str {
+        #[cfg(feature = "zebra-indexer")]
+        {
+            &self.zebra_indexer_url
+        }
+        #[cfg(feature = "lwd")]
+        {
+            ""
+        }
+    }
+
+    /// Zebra RPC cookie path, when cookie authentication is enabled.
+    pub fn chain_cookie_file(&self) -> Option<&std::path::Path> {
+        #[cfg(feature = "zebra-indexer")]
+        {
+            self.zebra_cookie_file.as_deref()
+        }
+        #[cfg(feature = "lwd")]
+        {
+            None
         }
     }
 
@@ -115,10 +202,29 @@ pub struct Cli {
     #[arg(long, value_name = "NET")]
     pub network: Option<String>,
 
-    /// lightwalletd (or Zaino) gRPC URL. Default: https://zec.rocks:443 (mainnet)
+    /// lightwalletd gRPC URL. Default: https://zec.rocks:443 (mainnet)
     /// or https://testnet.zec.rocks:443 (testnet).
+    #[cfg(feature = "lwd")]
     #[arg(long, value_name = "URL")]
     pub lwd_url: Option<String>,
+
+    /// Local Zebra JSON-RPC URL. Defaults to 127.0.0.1:8232 (mainnet)
+    /// or 127.0.0.1:18232 (testnet). Zebra's default cookie auth can be used
+    /// with --zebra-cookie-file or HTTP Basic credentials in the URL.
+    #[cfg(feature = "zebra-indexer")]
+    #[arg(long, value_name = "URL")]
+    pub zebra_url: Option<String>,
+
+    /// Local Zebra Indexer gRPC URL. Defaults to 127.0.0.1:8230 (mainnet)
+    /// or 127.0.0.1:18230 (testnet).
+    #[cfg(feature = "zebra-indexer")]
+    #[arg(long, value_name = "URL")]
+    pub zebra_indexer_url: Option<String>,
+
+    /// Path to Zebra's RPC cookie file (usually <cache-dir>/.cookie).
+    #[cfg(feature = "zebra-indexer")]
+    #[arg(long, value_name = "FILE")]
+    pub zebra_cookie_file: Option<PathBuf>,
 
     /// Mnemonic phrase to restore from. If omitted, a fresh wallet is generated.
     #[arg(long, value_name = "PHRASE")]
@@ -233,16 +339,38 @@ impl AppConfig {
             ZNetwork::Main
         };
 
-        // LWD URL: CLI > default per network.
+        #[cfg(feature = "lwd")]
         let lwd_url = cli
             .lwd_url
             .clone()
             .unwrap_or_else(|| AppConfig::default_lwd_url(network));
 
+        #[cfg(feature = "zebra-indexer")]
+        let zebra_url = cli
+            .zebra_url
+            .clone()
+            .unwrap_or_else(|| AppConfig::default_zebra_url(network));
+
+        #[cfg(feature = "zebra-indexer")]
+        let zebra_indexer_url = cli
+            .zebra_indexer_url
+            .clone()
+            .unwrap_or_else(|| AppConfig::default_zebra_indexer_url(network));
+
+        #[cfg(feature = "zebra-indexer")]
+        let zebra_cookie_file = cli.zebra_cookie_file.clone();
+
         Ok(AppConfig {
             network,
             datadir,
+            #[cfg(feature = "lwd")]
             lwd_url,
+            #[cfg(feature = "zebra-indexer")]
+            zebra_url,
+            #[cfg(feature = "zebra-indexer")]
+            zebra_indexer_url,
+            #[cfg(feature = "zebra-indexer")]
+            zebra_cookie_file,
             conf_path,
             seed_path,
             identity_path,

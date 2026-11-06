@@ -29,7 +29,8 @@ pub fn account_ufvk_encoded(
     let ufvk = account
         .ufvk()
         .ok_or_else(|| anyhow!("selected account has no unified full viewing key"))?;
-    Ok(ufvk.encode(&network))
+    ufvk.encode(&network)
+        .map_err(|e| anyhow!("encoding the account UFVK failed: {e}"))
 }
 
 /// Derive the network-specific encoded UFVK from the service seed at account
@@ -43,5 +44,7 @@ pub fn seed_ufvk_encoded(network: ZNetwork, seed: &SecretVec<u8>) -> anyhow::Res
     })?;
     let usk = UnifiedSpendingKey::from_seed(&network, seed.expose_secret(), account_index)
         .map_err(|_| anyhow!("deriving the service unified spending key failed"))?;
-    Ok(usk.to_unified_full_viewing_key().encode(&network))
+    usk.to_unified_full_viewing_key()
+        .encode(&network)
+        .map_err(|e| anyhow!("encoding the seed-derived UFVK failed: {e}"))
 }

@@ -35,18 +35,20 @@
 //! `zcash_client_sqlite 0.22.0-rc.1`, `zcash_keys 0.15`, `zcash_primitives 0.29`,
 //! `orchard 0.15`. These carry NU6.3/Ironwood support unconditionally.
 
+#[cfg(all(feature = "lwd", feature = "zebra-indexer"))]
+compile_error!("enable exactly one chain source feature: `lwd` or `zebra-indexer`");
+#[cfg(not(any(feature = "lwd", feature = "zebra-indexer")))]
+compile_error!("enable exactly one chain source feature: `lwd` or `zebra-indexer`");
+
 pub mod backoff;
+pub mod chain;
 pub mod config;
-pub mod error;
-pub mod hardening;
-pub mod lock;
-pub mod lwd;
 pub mod memo;
 pub mod network;
 pub mod otp;
 pub mod response_ledger;
 pub mod sync;
-pub mod wallet;
+pub mod wallet; // framework kept, not active until adapter ready
 
 use tracing::info;
 
@@ -105,7 +107,9 @@ pub async fn init_wallet(
         UnifiedSpendingKey::from_seed(&config.network, seed_bytes.expose_secret(), account_index)
             .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
     let ufvk = usk.to_unified_full_viewing_key();
-    let ufvk_encoded = ufvk.encode(&config.network);
+    let ufvk_encoded = ufvk
+        .encode(&config.network)
+        .context("encoding the service UFVK")?;
     let (service_address, _) = ufvk
         .default_address(UnifiedAddressRequest::AllAvailableKeys)
         .map_err(|e| anyhow::anyhow!("deriving service unified address: {e}"))?;
@@ -119,7 +123,13 @@ pub async fn init_wallet(
     // A fresh wallet has no prior funds, so its birthday is the current tip.
     // A restored wallet must receive an explicit, conservative birthday so it
     // never silently skips pre-existing auth payments or funds.
-    let mut bootstrap_client = lwd::LwdClient::connect(&config.lwd_url).await?;
+    let mut bootstrap_client = crate::chain::ChainClient::connect(
+        config.chain_url(),
+        config.chain_indexer_url(),
+        config.chain_cookie_file(),
+        config.network,
+    )
+    .await?;
     let birthday_height = match args.birthday {
         Some(0) => anyhow::bail!("wallet birthday must be at least height 1"),
         Some(height) => zcash_protocol::consensus::BlockHeight::from_u32(height),
@@ -162,7 +172,7 @@ pub async fn init_wallet(
         .get_account(account_id)
         .map_err(|e| anyhow::anyhow!("get_account: {e}"))?
         .and_then(|a: zcash_client_sqlite::wallet::Account| {
-            a.ufvk().map(|u| u.encode(&config.network))
+            a.ufvk().and_then(|u| u.encode(&config.network).ok())
         });
     if created_ufvk.as_deref() != Some(ufvk_encoded.as_str()) {
         anyhow::bail!("internal error: created account UFVK does not match the seed-derived UFVK");
@@ -242,7 +252,8 @@ fn ensure_identity(path: &std::path::Path) -> anyhow::Result<Vec<Box<dyn age::Re
 pub async fn run(config: config::AppConfig, init_args: config::InitArgs) -> anyhow::Result<()> {
     info!(
         network = config.network.name(),
-        lwd_url = %config.lwd_url,
+        chain_source = %config::CHAIN_SOURCE,
+        chain_url = %config.chain_url(),
         datadir = %config.datadir.display(),
         "starting ZFA authentication worker"
     );
@@ -267,7 +278,9 @@ pub async fn run(config: config::AppConfig, init_args: config::InitArgs) -> anyh
         wallet_dir: config.datadir.clone(),
         seed_path: config.seed_path.clone(),
         identity_path: config.identity_path.clone(),
-        lwd_url: config.lwd_url.clone(),
+        chain_url: config.chain_url().to_string(),
+        chain_indexer_url: config.chain_indexer_url().to_string(),
+        cookie_file: config.chain_cookie_file().map(std::path::Path::to_path_buf),
         sync_interval: config.sync_interval(),
         connect_timeout: config.connect_timeout(),
         reconnect_base: config.reconnect_base(),
