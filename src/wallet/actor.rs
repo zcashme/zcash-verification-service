@@ -18,7 +18,7 @@ use zcash_client_backend::data_api::wallet::{
 };
 use zcash_client_backend::data_api::{WalletRead as _, WalletWrite as _};
 use zcash_client_backend::fees::{
-    zip317::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy,
+    standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule,
 };
 use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_backend::{decrypt_transaction, DecryptedOutput, TransferType};
@@ -117,8 +117,6 @@ pub async fn build(cfg: ActorConfig) -> anyhow::Result<WalletActor> {
         chain_indexer_url: cfg.chain_indexer_url,
         cookie_file: cfg.cookie_file,
         client: None,
-        fee_rule: crate::fee::fallback_rule(),
-        fee_policy_loaded: false,
         tip_height: None,
         backoff: Backoff::new(cfg.reconnect_base, cfg.reconnect_max),
         sync_interval: cfg.sync_interval,
@@ -199,10 +197,6 @@ pub struct WalletActor {
     chain_indexer_url: String,
     cookie_file: Option<PathBuf>,
     client: Option<crate::chain::ChainClient>,
-    /// ZIP 317 fee rule for OTP responses. Starts as the compiled-in standard rule and is
-    /// replaced by the node's `getstandardfee` policy on the first successful connection.
-    fee_rule: zcash_primitives::transaction::fees::zip317::FeeRule,
-    fee_policy_loaded: bool,
     tip_height: Option<u32>,
     backoff: Backoff,
     sync_interval: Duration,
@@ -392,47 +386,7 @@ impl WalletActor {
         .map_err(|_| anyhow::anyhow!("connect timed out after {:?}", self.connect_timeout))??;
         self.client = Some(client);
         self.backoff.reset();
-        self.load_fee_policy().await;
         Ok(())
-    }
-
-    /// Fetch the node's fee policy once, on the first successful connection (i.e. at boot).
-    /// Any failure keeps the compiled-in ZIP 317 rule, which can only overpay.
-    async fn load_fee_policy(&mut self) {
-        if self.fee_policy_loaded {
-            return;
-        }
-        let Some(client) = self.client.as_mut() else {
-            return;
-        };
-        let fallback = crate::fee::fallback_marginal_fee_zats();
-        match tokio::time::timeout(Duration::from_secs(15), client.get_standard_fee()).await {
-            Ok(Ok(Some(fee))) => match crate::fee::rule_from_standard_fee(fee) {
-                Ok(rule) => {
-                    info!(
-                        "[zfa] fee policy from node: {} zats per logical action (version {})",
-                        fee.standard_fee, fee.version
-                    );
-                    self.fee_rule = rule;
-                    self.fee_policy_loaded = true;
-                }
-                Err(e) => {
-                    self.fee_policy_loaded = true;
-                    warn!("[zfa] ignoring node fee policy ({e}); using ZIP 317 default of {fallback} zats per logical action");
-                }
-            },
-            Ok(Ok(None)) => {
-                self.fee_policy_loaded = true;
-                info!("[zfa] chain source has no fee-policy RPC; using ZIP 317 default of {fallback} zats per logical action");
-            }
-            Ok(Err(e)) => {
-                self.fee_policy_loaded = true;
-                warn!("[zfa] getstandardfee failed ({e}); using ZIP 317 default of {fallback} zats per logical action");
-            }
-            Err(_) => {
-                warn!("[zfa] getstandardfee timed out; will retry on next connect, using ZIP 317 default of {fallback} zats per logical action for now");
-            }
-        }
     }
 
     async fn refresh_tip(&mut self) -> anyhow::Result<()> {
@@ -648,7 +602,6 @@ impl WalletActor {
             request,
             &usk,
             &self.prover,
-            &self.fee_rule,
         )?;
 
         if txids.len() != 1 {
@@ -814,14 +767,13 @@ fn do_send_otp_response(
     request: zip321::TransactionRequest,
     usk: &UnifiedSpendingKey,
     prover: &zcash_proofs::prover::LocalTxProver,
-    fee_rule: &zcash_primitives::transaction::fees::zip317::FeeRule,
 ) -> anyhow::Result<Vec<TxId>> {
     let target_note_count = NonZeroUsize::new(TARGET_NOTE_COUNT)
         .ok_or_else(|| anyhow::anyhow!("target note count must be nonzero"))?;
     let min_split_output = Zatoshis::from_u64(MIN_SPLIT_OUTPUT_VALUE)
         .map_err(|e| anyhow::anyhow!("invalid minimum split-output value: {e}"))?;
     let change_strategy = MultiOutputChangeStrategy::new(
-        fee_rule.clone(),
+        StandardFeeRule::Zip317,
         None,
         zcash_protocol::ShieldedPool::Ironwood,
         DustOutputPolicy::default(),

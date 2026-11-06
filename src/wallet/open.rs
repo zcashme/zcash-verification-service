@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+
 use zcash_client_sqlite::chain::init::init_blockmeta_db;
 use zcash_client_sqlite::chain::BlockMeta;
 use zcash_client_sqlite::util::SystemClock;
@@ -38,12 +39,7 @@ pub fn open_write(network: ZNetwork, wallet_dir: &Path) -> anyhow::Result<WriteD
     let conn = rusqlite::Connection::open(&path)?;
     restrict_wallet_db_permissions(&path)?;
     configure_writer_conn(&conn)?;
-    Ok(WalletDb::from_connection(
-        conn,
-        network,
-        SystemClock,
-        rand_core::UnwrapErr(getrandom::SysRng),
-    ))
+    Ok(WalletDb::from_connection(conn, network, SystemClock, rand_core::UnwrapErr(getrandom::SysRng)))
 }
 
 /// `data.sqlite` contains the service viewing key and decrypted transaction
