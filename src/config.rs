@@ -23,9 +23,9 @@ pub const ACCOUNT_INDEX: u32 = 0;
 /// Account label (required by librustzcash's create_account API; zfa never reads it back).
 pub const ACCOUNT_NAME: &str = "primary";
 
-/// Default lightwalletd gRPC endpoint (mainnet) — zec.rocks public instance.
+/// Default lightwalletd gRPC endpoint (mainnet) — zec.global public instance, backed by zingod.
 #[cfg(feature = "lwd")]
-pub const LWD_DEFAULT_URL_MAIN: &str = "https://zec.rocks:443";
+pub const LWD_DEFAULT_URL_MAIN: &str = "https://zec.global:443";
 /// Default lightwalletd gRPC endpoint (testnet) — zec.rocks public testnet instance.
 #[cfg(feature = "lwd")]
 pub const LWD_DEFAULT_URL_TEST: &str = "https://testnet.zec.rocks:443";
@@ -202,7 +202,7 @@ pub struct Cli {
     #[arg(long, value_name = "NET")]
     pub network: Option<String>,
 
-    /// lightwalletd gRPC URL. Default: https://zec.rocks:443 (mainnet)
+    /// lightwalletd gRPC URL. Default: https://zec.global:443 (mainnet)
     /// or https://testnet.zec.rocks:443 (testnet).
     #[cfg(feature = "lwd")]
     #[arg(long, value_name = "URL")]

@@ -84,7 +84,7 @@ encrypted seed. CLI flags override a few values.
 |------|---------|---------|
 | `--datadir` | `./zfa-data` | Data directory |
 | `--network` | `main` | `main`, `test`, or `regtest` |
-| `--lwd-url` | `https://zec.rocks:443` | lightwalletd/zingod gRPC endpoint |
+| `--lwd-url` | `https://zec.global:443` | lightwalletd/zingod gRPC endpoint |
 | `--zebra-url` | `http://127.0.0.1:8232` | Local Zebra JSON-RPC endpoint (`zebra-indexer` build) |
 | `--zebra-indexer-url` | `http://127.0.0.1:8230` | Local Zebra Indexer gRPC endpoint (`zebra-indexer` build) |
 | `--zebra-cookie-file` | — | Zebra RPC cookie file when cookie authentication is enabled |
@@ -92,9 +92,9 @@ encrypted seed. CLI flags override a few values.
 | `--birthday` | chain tip | Earliest block that may contain funds |
 | `--keys-file` | same as `--conf` | `[seed]` table from external file (k8s Secret) |
 
-`https://zec.global:443` is a highly available public mainnet endpoint that
-zingolabs operates, backed by zingod. Pass it with `--lwd-url` to use it in
-place of the default.
+The mainnet default, `https://zec.global:443`, is a highly available public
+endpoint that zingolabs operates, backed by zingod. Pass another endpoint with
+`--lwd-url` to use it in place of the default.
 
 | Env | Purpose |
 |-----|---------|
