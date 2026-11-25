@@ -9,7 +9,7 @@ OTP locally.
 
 ## What it does
 
-1. Connects to lightwalletd (or Zaino) over gRPC, or to a local Zebra node over
+1. Connects to lightwalletd (or zingod) over gRPC, or to a local Zebra node over
    JSON-RPC with its Indexer gRPC endpoint for mempool and tip notifications.
 2. Syncs confirmed blocks to recover wallet state.
 3. Streams mempool notifications for real-time auth payment detection. LWD uses
@@ -44,7 +44,7 @@ Restore from an existing mnemonic:
 |------|---------|---------|
 | `--datadir` | `./zfa-data` | Data directory |
 | `--network` | `main` | `main`, `test`, or `regtest` |
-| `--lwd-url` | `https://zec.rocks:443` | lightwalletd/Zaino gRPC endpoint |
+| `--lwd-url` | `https://zec.rocks:443` | lightwalletd/zingod gRPC endpoint |
 | `--zebra-url` | `http://127.0.0.1:8232` | Zebra JSON-RPC endpoint (`zebra-indexer` build) |
 | `--zebra-indexer-url` | `http://127.0.0.1:8230` | Zebra Indexer gRPC endpoint (`zebra-indexer` build) |
 | `--zebra-cookie-file` | — | Zebra RPC cookie file when cookie authentication is enabled |
@@ -56,6 +56,10 @@ Restore from an existing mnemonic:
 |-----|---------|
 | `RUST_LOG` | Log level (default: `info`) |
 | `ZFA_REGTEST_NU63_HEIGHT` | NU6.3 activation height for regtest |
+
+`https://zec.global:443` is a highly available public mainnet endpoint that
+zingolabs operates, backed by zingod. Pass it with `--lwd-url` to use it in
+place of the default.
 
 Build with `cargo build --release --no-default-features --features zebra-indexer`
 to use the local Zebra backend. Zebra must have its JSON-RPC server and Indexer
