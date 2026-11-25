@@ -415,7 +415,7 @@ impl WalletActor {
     /// Process one unmined transaction from `GetMempoolStream`.
     ///
     /// The stream's `RawTransaction.height` is intentionally ignored. The
-    /// lightwalletd proto convention is zero while Zaino currently reports the
+    /// lightwalletd proto convention is zero while zingod currently reports the
     /// best-tip height, but both values describe a mempool event. The pinned
     /// `zcash_client_backend::decrypt_transaction` API expects `None` plus the
     /// current tip for this case and handles Sapling, Orchard, and Ironwood.

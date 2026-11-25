@@ -23,7 +23,7 @@ renders ZIP-321 QR              incoming txid ──→       watches chain memp
 verifies OTP locally            response txid          decrypts + sends OTP response
 ```
 
-1. Connect to lightwalletd/Zaino gRPC, or local Zebra JSON-RPC plus Indexer gRPC.
+1. Connect to lightwalletd/zingod gRPC, or local Zebra JSON-RPC plus Indexer gRPC.
 2. Sync confirmed blocks to recover wallet state.
 3. Stream mempool notifications for real-time auth payment detection (`GetMempoolStream`
    from LWD, or Zebra Indexer events resolved through JSON-RPC).
@@ -39,7 +39,7 @@ verifies OTP locally            response txid          decrypts + sends OTP resp
 - **Zcash:** librustzcash crates pinned to the ironwood/NU6.3 line (same as `zecd`):
   `zcash_client_backend 0.24.0-rc.6`, `zcash_client_sqlite 0.22.0-rc.6`,
   `zcash_keys 0.16`, `zcash_primitives 0.30`, `orchard 0.15`.
-- **Chain access:** `tonic` gRPC to lightwalletd/Zaino, or local Zebra JSON-RPC
+- **Chain access:** `tonic` gRPC to lightwalletd/zingod, or local Zebra JSON-RPC
   plus Zebra Indexer gRPC for push notifications. The Indexer mempool stream
   reports transaction IDs; JSON-RPC fetches the raw transaction.
 - **Storage:** SQLite — `data.sqlite` (wallet DB, owned by `zcash_client_sqlite`),
@@ -58,7 +58,7 @@ src/
   network.rs         ZNetwork (main/test/regtest) implementing zcash Parameters
   otp.rs             deterministic 6-digit OTP generation + constant-time verify
   memo.rs            strict 512-byte ZFA memo parser
-  lwd.rs             thin lightwalletd/Zaino gRPC client wrapper
+  lwd.rs             thin lightwalletd/zingod gRPC client wrapper
   sync.rs            block sync + reorg recovery (scan_cached_blocks)
   response_ledger.rs durable idempotence state machine for OTP responses
   backoff.rs         exponential backoff with full jitter for reconnects
@@ -84,13 +84,17 @@ encrypted seed. CLI flags override a few values.
 |------|---------|---------|
 | `--datadir` | `./zfa-data` | Data directory |
 | `--network` | `main` | `main`, `test`, or `regtest` |
-| `--lwd-url` | `https://zec.rocks:443` | lightwalletd/Zaino gRPC endpoint |
+| `--lwd-url` | `https://zec.global:443` | lightwalletd/zingod gRPC endpoint |
 | `--zebra-url` | `http://127.0.0.1:8232` | Local Zebra JSON-RPC endpoint (`zebra-indexer` build) |
 | `--zebra-indexer-url` | `http://127.0.0.1:8230` | Local Zebra Indexer gRPC endpoint (`zebra-indexer` build) |
 | `--zebra-cookie-file` | — | Zebra RPC cookie file when cookie authentication is enabled |
 | `--mnemonic` | — | Restore from mnemonic (requires `--birthday`) |
 | `--birthday` | chain tip | Earliest block that may contain funds |
 | `--keys-file` | same as `--conf` | `[seed]` table from external file (k8s Secret) |
+
+The mainnet default, `https://zec.global:443`, is a highly available public
+endpoint that zingolabs operates, backed by zingod. Pass another endpoint with
+`--lwd-url` to use it in place of the default.
 
 | Env | Purpose |
 |-----|---------|

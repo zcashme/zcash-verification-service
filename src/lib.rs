@@ -12,14 +12,14 @@
 //! ```text
 //! Consumer app server             response ledger       ZFA worker
 //! ───────────────────             ───────────────       ──────────
-//! creates app session                                      connects to lightwalletd or Zaino
+//! creates app session                                      connects to lightwalletd or zingod
 //! renders ZIP-321 QR               incoming txid ──→      watches GetMempoolStream
 //! verifies OTP locally             response txid          decrypts and sends OTP response
 //! ```
 //!
 //! The worker owns one service wallet (a single shielded Zcash account) used
 //! to decrypt incoming auth payments and send OTP response transactions. It
-//! connects to a lightwalletd (or Zaino) gRPC endpoint — both serve the same
+//! connects to a lightwalletd (or zingod) gRPC endpoint — both serve the same
 //! `CompactTxStream` proto, so the backend is selected by a config URL.
 //!
 //! ## Configuration

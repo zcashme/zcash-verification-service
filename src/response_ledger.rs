@@ -62,7 +62,7 @@ pub enum Claim {
 }
 
 /// A response that was constructed locally but has not yet been acknowledged
-/// by the configured lightwalletd/Zaino server.
+/// by the configured lightwalletd/zingod server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingBroadcast {
     pub incoming_txid: String,
@@ -143,7 +143,7 @@ fn restrict_permissions(_path: &Path) -> anyhow::Result<()> {
 }
 
 /// Claim an incoming auth payment. At most one response is ever created for a
-/// transaction ID, even if a lightwalletd/Zaino stream reconnect replays it.
+/// transaction ID, even if a lightwalletd/zingod stream reconnect replays it.
 pub fn claim(conn: &mut Connection, incoming_txid: &str) -> anyhow::Result<Claim> {
     let transaction = conn.transaction()?;
     let inserted = transaction.execute(
